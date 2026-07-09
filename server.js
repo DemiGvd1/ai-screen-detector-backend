@@ -291,21 +291,33 @@ app.delete('/admin/trending/:id', requireAdmin, async (req, res) => {
 // and title using TikTok's public oEmbed feature (the same thing
 // used for legitimate link previews, not a workaround).
 app.get('/admin/fetch-preview', requireAdmin, async (req, res) => {
-  const videoUrl = req.query.url;
-  if (!videoUrl) {
+  const rawUrl = req.query.url;
+  if (!rawUrl) {
     return res.status(400).json({ error: 'Provide ?url=... pointing to a TikTok video.' });
   }
   try {
-    const oembedUrl = `https://www.tiktok.com/oembed?url=${encodeURIComponent(videoUrl)}`;
+    // TikTok's "Copy Link" button gives short links like vt.tiktok.com/xxx,
+    // which oEmbed can't read directly. Follow the redirect first to get
+    // the full, expanded link (tiktok.com/@user/video/123...).
+    let resolvedUrl = rawUrl;
+    try {
+      const redirectCheck = await fetch(rawUrl, { method: 'HEAD', redirect: 'follow' });
+      if (redirectCheck.url) resolvedUrl = redirectCheck.url;
+    } catch (redirectErr) {
+      // If expanding fails for any reason, just try the original link as-is.
+    }
+
+    const oembedUrl = `https://www.tiktok.com/oembed?url=${encodeURIComponent(resolvedUrl)}`;
     const response = await fetch(oembedUrl);
     if (!response.ok) {
-      return res.status(502).json({ error: 'TikTok did not recognize that link.' });
+      return res.status(502).json({ error: 'TikTok did not recognize that link.', resolved_url: resolvedUrl });
     }
     const data = await response.json();
     res.json({
       title: data.title || null,
       thumbnail_url: data.thumbnail_url || null,
       author_name: data.author_name || null,
+      resolved_url: resolvedUrl,
     });
   } catch (err) {
     console.error('Error in /admin/fetch-preview:', err);
