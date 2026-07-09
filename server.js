@@ -15,6 +15,48 @@ app.use(express.json());
 initDB().catch((err) => console.error('Database setup failed:', err));
 
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
+const HUGGINGFACE_API_KEY = process.env.HUGGINGFACE_API_KEY;
+const pdfParse = require('pdf-parse');
+const mammoth = require('mammoth');
+
+// Sends text to a free, open-source AI-text-detector model hosted on
+// Hugging Face, and returns a 0-1 "probability this is AI-written" score.
+async function detectAIText(text) {
+  const response = await fetch(
+    'https://api-inference.huggingface.co/models/fakespot-ai/roberta-base-ai-text-detection-v1',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${HUGGINGFACE_API_KEY}`,
+      },
+      body: JSON.stringify({ inputs: text }),
+    }
+  );
+
+  const data = await response.json();
+
+  // Free-tier models sometimes need a few seconds to "wake up" the
+  // first time they're called. If that happens, wait and try once more.
+  if (data.error && data.estimated_time) {
+    await new Promise((resolve) => setTimeout(resolve, Math.min(data.estimated_time * 1000, 15000)));
+    return detectAIText(text);
+  }
+
+  // The response is a list of {label, score} pairs. We look for
+  // whichever label clearly means "AI-generated" or "human", since
+  // exact label wording can vary between models.
+  const results = Array.isArray(data[0]) ? data[0] : data;
+  if (!Array.isArray(results)) return null;
+
+  const aiEntry = results.find((r) => /ai|generated|fake|machine/i.test(r.label));
+  if (aiEntry) return aiEntry.score;
+
+  const humanEntry = results.find((r) => /human|real/i.test(r.label));
+  if (humanEntry) return 1 - humanEntry.score;
+
+  return results[0] ? results[0].score : null;
+}
 
 // Only requests that include the correct secret get through.
 // This is your "admin only" gate — no accounts, no login screen,
@@ -242,6 +284,152 @@ app.post('/analyze-audio', uploadMedia.single('audio'), async (req, res) => {
   }
 });
 
+// ---------- TEXT ----------
+app.post('/analyze-text', async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text || text.trim().length < 50) {
+      return res.status(400).json({ error: 'Please provide at least a few sentences (50+ characters) to analyze.' });
+    }
+    if (!HUGGINGFACE_API_KEY) {
+      return res.status(500).json({ error: 'Server is missing its GPTZero credentials.' });
+    }
+
+    const score = await detectAIText(text);
+    const { verdict, confidence } = scoreToVerdict(score);
+
+    res.json({
+      verdict,
+      confidence,
+      media_type: 'text',
+      source: 'huggingface',
+    });
+  } catch (err) {
+    console.error('Error in /analyze-text:', err);
+    res.status(500).json({ error: 'Something went wrong analyzing the text.' });
+  }
+});
+
+// ---------- DOCUMENTS (PDF / Word) ----------
+app.post('/analyze-document', uploadMedia.single('document'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No document received. Send it as form-data under the field name "document".' });
+    }
+    if (!HUGGINGFACE_API_KEY) {
+      return res.status(500).json({ error: 'Server is missing its GPTZero credentials.' });
+    }
+
+    const filename = (req.file.originalname || '').toLowerCase();
+    let extractedText = '';
+
+    if (filename.endsWith('.pdf')) {
+      const parsed = await pdfParse(req.file.buffer);
+      extractedText = parsed.text;
+    } else if (filename.endsWith('.docx')) {
+      const result = await mammoth.extractRawText({ buffer: req.file.buffer });
+      extractedText = result.value;
+    } else {
+      extractedText = req.file.buffer.toString('utf-8');
+    }
+
+    if (!extractedText || extractedText.trim().length < 50) {
+      return res.status(400).json({ error: 'Could not find enough readable text in that document.' });
+    }
+
+    // GPTZero has a length limit, so trim very long documents.
+    const trimmedText = extractedText.slice(0, 5000);
+    const score = await detectAIText(trimmedText);
+    const { verdict, confidence } = scoreToVerdict(score);
+
+    res.json({
+      verdict,
+      confidence,
+      media_type: 'document',
+      source: 'huggingface',
+    });
+  } catch (err) {
+    console.error('Error in /analyze-document:', err);
+    res.status(500).json({ error: 'Something went wrong analyzing the document.' });
+  }
+});
+
+// ---------- LINK (TikTok / Instagram paste-a-link) ----------
+const { execFile } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+app.post('/analyze-link', async (req, res) => {
+  const { url } = req.body;
+  if (!url) {
+    return res.status(400).json({ error: 'Provide a "url" to analyze.' });
+  }
+  if (!SIGHTENGINE_API_USER || !SIGHTENGINE_API_SECRET) {
+    return res.status(500).json({ error: 'Server is missing its Sightengine credentials.' });
+  }
+
+  const tempPath = path.join(os.tmpdir(), `link-${Date.now()}.mp4`);
+
+  execFile('./yt-dlp', ['-f', 'best[ext=mp4]/best', '-o', tempPath, url], { timeout: 60000 }, async (err) => {
+    if (err) {
+      console.error('yt-dlp error:', err);
+      return res.status(502).json({ error: 'Could not download that link. It may be private, region-locked, or an unsupported platform.' });
+    }
+
+    try {
+      const videoBuffer = fs.readFileSync(tempPath);
+
+      const form = new FormData();
+      form.append('media', videoBuffer, { filename: 'link-video.mp4' });
+      form.append('models', 'genai,deepfake');
+      form.append('api_user', SIGHTENGINE_API_USER);
+      form.append('api_secret', SIGHTENGINE_API_SECRET);
+
+      const sightengineResponse = await fetch('https://api.sightengine.com/1.0/video/check-sync.json', {
+        method: 'POST',
+        body: form,
+      });
+      const data = await sightengineResponse.json();
+
+      fs.unlink(tempPath, () => { }); // clean up the temp file either way
+
+      if (data.status !== 'success') {
+        return res.status(502).json({ error: 'Sightengine returned an error', details: data });
+      }
+
+      const frames = (data.data && data.data.frames) || [];
+      let aiScore = null;
+      let deepfakeScore = null;
+      for (const frame of frames) {
+        const frameAi = frame.type && frame.type.ai_generated;
+        const frameDeepfake = frame.deepfake && frame.deepfake.score;
+        if (typeof frameAi === 'number' && (aiScore === null || frameAi > aiScore)) aiScore = frameAi;
+        if (typeof frameDeepfake === 'number' && (deepfakeScore === null || frameDeepfake > deepfakeScore)) deepfakeScore = frameDeepfake;
+      }
+
+      const top = pickTopScore([
+        { label: 'ai_generated', value: aiScore },
+        { label: 'deepfake', value: deepfakeScore },
+      ]);
+      const { verdict, confidence } = scoreToVerdict(top ? top.value : null);
+
+      res.json({
+        verdict,
+        confidence,
+        flagged_by: top ? top.label : null,
+        media_type: 'video',
+        source: 'sightengine',
+        from_link: true,
+      });
+    } catch (processErr) {
+      console.error('Error processing downloaded video:', processErr);
+      fs.unlink(tempPath, () => { });
+      res.status(500).json({ error: 'Downloaded the video but could not analyze it.' });
+    }
+  });
+});
+
 // ---------- TRENDING FEED ----------
 
 // Public — the app calls this to load the scrollable feed.
@@ -301,10 +489,10 @@ app.get('/admin/fetch-preview', requireAdmin, async (req, res) => {
     // the full, expanded link (tiktok.com/@user/video/123...).
     let resolvedUrl = rawUrl;
     try {
-      const redirectCheck = await fetch(rawUrl, { method: 'HEAD', redirect: 'follow' });
+      const redirectCheck = await fetch(rawUrl, { method: 'GET', redirect: 'follow' });
       if (redirectCheck.url) resolvedUrl = redirectCheck.url;
     } catch (redirectErr) {
-      // If expanding fails for any reason, just try the original link as-is.
+      console.error('Redirect resolution failed:', redirectErr.message);
     }
 
     const oembedUrl = `https://www.tiktok.com/oembed?url=${encodeURIComponent(resolvedUrl)}`;
