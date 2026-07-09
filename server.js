@@ -383,6 +383,23 @@ function isAllowedSocialLink(rawUrl) {
   }
 }
 
+// Admin only — quick way to check if the yt-dlp tool actually got
+// installed during the build, without running the full link analysis.
+app.get('/admin/check-ytdlp', requireAdmin, (req, res) => {
+  execFile('./yt-dlp', ['--version'], (err, stdout, stderr) => {
+    if (err) {
+      return res.status(500).json({
+        installed: false,
+        error: err.message,
+      });
+    }
+    res.json({
+      installed: true,
+      version: stdout.trim(),
+    });
+  });
+});
+
 app.post('/analyze-link', async (req, res) => {
   const { url } = req.body;
   if (!url) {
