@@ -18,8 +18,14 @@ async function initDB() {
       thumbnail_url TEXT,
       ai_score DOUBLE PRECISION,
       category TEXT,
+      source_platform TEXT,
       created_at TIMESTAMPTZ DEFAULT now()
     );
+  `);
+  // Adds the column automatically if the table already existed
+  // from before this change, without losing existing data.
+  await pool.query(`
+    ALTER TABLE trending_posts ADD COLUMN IF NOT EXISTS source_platform TEXT;
   `);
   console.log('Database ready: trending_posts table exists.');
 }

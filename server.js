@@ -259,15 +259,15 @@ app.get('/trending', async (req, res) => {
 
 // Admin only — adds a new post to the feed.
 app.post('/admin/trending', requireAdmin, async (req, res) => {
-  const { title, video_url, thumbnail_url, ai_score, category } = req.body;
+  const { title, video_url, thumbnail_url, ai_score, category, source_platform } = req.body;
   if (!title || !video_url) {
     return res.status(400).json({ error: 'title and video_url are required.' });
   }
   try {
     const result = await pool.query(
-      `INSERT INTO trending_posts (title, video_url, thumbnail_url, ai_score, category)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [title, video_url, thumbnail_url || null, ai_score || null, category || null]
+      `INSERT INTO trending_posts (title, video_url, thumbnail_url, ai_score, category, source_platform)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [title, video_url, thumbnail_url || null, ai_score || null, category || null, source_platform || null]
     );
     res.json(result.rows[0]);
   } catch (err) {
@@ -284,6 +284,32 @@ app.delete('/admin/trending/:id', requireAdmin, async (req, res) => {
   } catch (err) {
     console.error('Error in /admin/trending delete:', err);
     res.status(500).json({ error: 'Could not delete post.' });
+  }
+});
+
+// Admin only — given a TikTok link, fetches its official thumbnail
+// and title using TikTok's public oEmbed feature (the same thing
+// used for legitimate link previews, not a workaround).
+app.get('/admin/fetch-preview', requireAdmin, async (req, res) => {
+  const videoUrl = req.query.url;
+  if (!videoUrl) {
+    return res.status(400).json({ error: 'Provide ?url=... pointing to a TikTok video.' });
+  }
+  try {
+    const oembedUrl = `https://www.tiktok.com/oembed?url=${encodeURIComponent(videoUrl)}`;
+    const response = await fetch(oembedUrl);
+    if (!response.ok) {
+      return res.status(502).json({ error: 'TikTok did not recognize that link.' });
+    }
+    const data = await response.json();
+    res.json({
+      title: data.title || null,
+      thumbnail_url: data.thumbnail_url || null,
+      author_name: data.author_name || null,
+    });
+  } catch (err) {
+    console.error('Error in /admin/fetch-preview:', err);
+    res.status(500).json({ error: 'Could not fetch preview.' });
   }
 });
 
