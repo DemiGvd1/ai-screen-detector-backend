@@ -360,10 +360,38 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// Only these platforms are allowed — this stops people from pasting
+// random/unknown links, which could otherwise let someone misuse your
+// server to fetch arbitrary web addresses.
+const ALLOWED_LINK_DOMAINS = [
+  'tiktok.com',
+  'vt.tiktok.com',
+  'vm.tiktok.com',
+  'instagram.com',
+  'facebook.com',
+  'fb.watch',
+  'twitter.com',
+  'x.com',
+];
+
+function isAllowedSocialLink(rawUrl) {
+  try {
+    const hostname = new URL(rawUrl).hostname.toLowerCase();
+    return ALLOWED_LINK_DOMAINS.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`));
+  } catch {
+    return false;
+  }
+}
+
 app.post('/analyze-link', async (req, res) => {
   const { url } = req.body;
   if (!url) {
     return res.status(400).json({ error: 'Provide a "url" to analyze.' });
+  }
+  if (!isAllowedSocialLink(url)) {
+    return res.status(400).json({
+      error: 'Please paste a link from TikTok, Instagram, Facebook, or Twitter/X.',
+    });
   }
   if (!SIGHTENGINE_API_USER || !SIGHTENGINE_API_SECRET) {
     return res.status(500).json({ error: 'Server is missing its Sightengine credentials.' });
