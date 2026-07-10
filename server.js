@@ -83,7 +83,15 @@ async function analyzeVideoFrames(videoBuffer) {
       if (result.deepfake !== null && (deepfakeScore === null || result.deepfake > deepfakeScore)) deepfakeScore = result.deepfake;
     }
 
-    return { aiScore, deepfakeScore, frameCount: frameFiles.length };
+    // Grab the first frame as a reusable thumbnail (base64) so callers
+    // like Link scan can save it to history without a second download.
+    let thumbnailBase64 = null;
+    if (frameFiles.length > 0) {
+      const firstFrameBuffer = fs.readFileSync(path.join(tempDir, frameFiles[0]));
+      thumbnailBase64 = firstFrameBuffer.toString('base64');
+    }
+
+    return { aiScore, deepfakeScore, frameCount: frameFiles.length, thumbnailBase64 };
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -91,41 +99,56 @@ async function analyzeVideoFrames(videoBuffer) {
 
 // Sends text to a free, open-source AI-text-detector model hosted on
 // Hugging Face, and returns a 0-1 "probability this is AI-written" score.
-async function detectAIText(text) {
-  const response = await fetch(
-    'https://api-inference.huggingface.co/models/fakespot-ai/roberta-base-ai-text-detection-v1',
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${HUGGINGFACE_API_KEY}`,
-      },
-      body: JSON.stringify({ inputs: text }),
+async function detectAIText(text, attempt = 1) {
+  try {
+    const response = await fetch(
+      'https://api-inference.huggingface.co/models/fakespot-ai/roberta-base-ai-text-detection-v1',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${HUGGINGFACE_API_KEY}`,
+        },
+        body: JSON.stringify({ inputs: text }),
+      }
+    );
+
+    const data = await response.json();
+
+    if (data.error && data.estimated_time) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(data.estimated_time * 1000, 15000)));
+      return detectAIText(text);
     }
-  );
 
-  const data = await response.json();
+    const results = Array.isArray(data[0]) ? data[0] : data;
+    if (!Array.isArray(results)) return null;
 
-  // Free-tier models sometimes need a few seconds to "wake up" the
-  // first time they're called. If that happens, wait and try once more.
-  if (data.error && data.estimated_time) {
-    await new Promise((resolve) => setTimeout(resolve, Math.min(data.estimated_time * 1000, 15000)));
-    return detectAIText(text);
+    const aiEntry = results.find((r) => /ai|generated|fake|machine/i.test(r.label));
+    if (aiEntry) return aiEntry.score;
+
+    const humanEntry = results.find((r) => /human|real/i.test(r.label));
+    if (humanEntry) return 1 - humanEntry.score;
+
+    return results[0] ? results[0].score : null;
+  } catch (err) {
+    // Occasional transient DNS/network hiccups from Render's side —
+    // retry once before giving up.
+    if (attempt < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      return detectAIText(text, attempt + 1);
+    }
+    throw err;
   }
+}
 
-  // The response is a list of {label, score} pairs. We look for
-  // whichever label clearly means "AI-generated" or "human", since
-  // exact label wording can vary between models.
-  const results = Array.isArray(data[0]) ? data[0] : data;
-  if (!Array.isArray(results)) return null;
-
-  const aiEntry = results.find((r) => /ai|generated|fake|machine/i.test(r.label));
-  if (aiEntry) return aiEntry.score;
-
-  const humanEntry = results.find((r) => /human|real/i.test(r.label));
-  if (humanEntry) return 1 - humanEntry.score;
-
-  return results[0] ? results[0].score : null;
+function reasonForTextVerdict(verdict, confidence) {
+  if (verdict === 'likely_ai') {
+    return `The writing style closely matches patterns common in AI-generated text (${Math.round(confidence * 100)}% match).`;
+  }
+  if (verdict === 'likely_real') {
+    return `The writing style matches typical human writing patterns (${Math.round(confidence * 100)}% confidence).`;
+  }
+  return 'The writing style has mixed signals — not confident enough to call this either way.';
 }
 
 // Only requests that include the correct secret get through.
@@ -177,6 +200,28 @@ function scoreToVerdict(score) {
 }
 
 // Given several detector scores, picks whichever one is most confident.
+// Turns real detector signals into a plain-English explanation. This
+// never invents specific visual details — only describes which real
+// signal (if any) triggered, based on actual scores we have.
+function reasonForVerdict(verdict, flaggedBy) {
+  if (verdict === 'likely_ai') {
+    if (flaggedBy === 'ai_generated') {
+      return "Flagged mainly by our AI-generation detector — this closely matches patterns seen in fully AI-generated content.";
+    }
+    if (flaggedBy === 'deepfake') {
+      return "Flagged mainly by our face-swap detector — signs of facial manipulation were found.";
+    }
+    if (flaggedBy === 'ai_music' || flaggedBy === 'ai_speech') {
+      return "Flagged by our AI-audio detector based on synthetic voice/audio patterns.";
+    }
+    return "Multiple signals pointed toward AI-generated content.";
+  }
+  if (verdict === 'likely_real') {
+    return "No strong AI-generation or manipulation signals were detected.";
+  }
+  return "Signals were mixed — not confident enough to call this either way.";
+}
+
 function pickTopScore(entries) {
   const valid = entries.filter((e) => typeof e.value === 'number');
   if (valid.length === 0) return null;
@@ -224,6 +269,7 @@ app.post('/analyze', uploadImage.single('image'), async (req, res) => {
     res.json({
       verdict,
       confidence,
+      reason: reasonForVerdict(verdict, top ? top.label : null),
       flagged_by: top ? top.label : null,
       scores: { ai_generated: aiScore, deepfake: deepfakeScore },
       media_type: 'image',
@@ -259,6 +305,7 @@ app.post('/analyze-video', uploadMedia.single('video'), async (req, res) => {
     res.json({
       verdict,
       confidence,
+      reason: reasonForVerdict(verdict, top ? top.label : null),
       flagged_by: top ? top.label : null,
       scores: { ai_generated: aiScore, deepfake: deepfakeScore },
       media_type: 'video',
@@ -340,6 +387,7 @@ app.post('/analyze-text', async (req, res) => {
     res.json({
       verdict,
       confidence,
+      reason: confidence !== null ? reasonForTextVerdict(verdict, confidence) : null,
       media_type: 'text',
       source: 'internal',
     });
@@ -461,7 +509,7 @@ app.post('/analyze-link', async (req, res) => {
       const videoBuffer = fs.readFileSync(tempPath);
       fs.unlink(tempPath, () => {}); // clean up the temp file either way
 
-      const { aiScore, deepfakeScore } = await analyzeVideoFrames(videoBuffer);
+      const { aiScore, deepfakeScore, thumbnailBase64 } = await analyzeVideoFrames(videoBuffer);
 
       const top = pickTopScore([
         { label: 'ai_generated', value: aiScore },
@@ -472,10 +520,12 @@ app.post('/analyze-link', async (req, res) => {
       res.json({
         verdict,
         confidence,
+        reason: reasonForVerdict(verdict, top ? top.label : null),
         flagged_by: top ? top.label : null,
         media_type: 'video',
         source: 'internal',
         from_link: true,
+        thumbnail_base64: thumbnailBase64,
       });
     } catch (processErr) {
       console.error('Error processing downloaded video:', processErr);
