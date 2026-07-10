@@ -200,6 +200,41 @@ function scoreToVerdict(score) {
 }
 
 // Given several detector scores, picks whichever one is most confident.
+// Generates a real, honest description of what's actually in an image
+// (e.g. "a woman dancing in a red dress"), using a free image-captioning
+// model. This is separate from AI-detection — it just describes the
+// scene, same as a person would.
+async function generateImageCaption(imageBuffer, attempt = 1) {
+  try {
+    const response = await fetch(
+      'https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-base',
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${HUGGINGFACE_API_KEY}` },
+        body: imageBuffer,
+      }
+    );
+    const data = await response.json();
+
+    if (data.error && data.estimated_time) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(data.estimated_time * 1000, 15000)));
+      return generateImageCaption(imageBuffer);
+    }
+
+    if (Array.isArray(data) && data[0] && data[0].generated_text) {
+      return data[0].generated_text;
+    }
+    return null;
+  } catch (err) {
+    if (attempt < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      return generateImageCaption(imageBuffer, attempt + 1);
+    }
+    console.error('Caption generation failed:', err.message);
+    return null; // Non-critical — the scan still works without a caption.
+  }
+}
+
 // Turns real detector signals into a plain-English explanation. This
 // never invents specific visual details — only describes which real
 // signal (if any) triggered, based on actual scores we have.
@@ -246,10 +281,12 @@ app.post('/analyze', uploadImage.single('image'), async (req, res) => {
     form.append('api_user', SIGHTENGINE_API_USER);
     form.append('api_secret', SIGHTENGINE_API_SECRET);
 
-    const sightengineResponse = await fetch('https://api.sightengine.com/1.0/check.json', {
-      method: 'POST',
-      body: form,
-    });
+    // Run detection and captioning at the same time — captioning is
+    // optional/non-critical, so if it fails, the scan still succeeds.
+    const [sightengineResponse, caption] = await Promise.all([
+      fetch('https://api.sightengine.com/1.0/check.json', { method: 'POST', body: form }),
+      generateImageCaption(req.file.buffer),
+    ]);
     const data = await sightengineResponse.json();
 
     if (data.status !== 'success') {
@@ -269,6 +306,7 @@ app.post('/analyze', uploadImage.single('image'), async (req, res) => {
     res.json({
       verdict,
       confidence,
+      caption,
       reason: reasonForVerdict(verdict, top ? top.label : null),
       flagged_by: top ? top.label : null,
       scores: { ai_generated: aiScore, deepfake: deepfakeScore },
