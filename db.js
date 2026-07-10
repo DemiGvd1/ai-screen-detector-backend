@@ -19,14 +19,16 @@ async function initDB() {
       ai_score DOUBLE PRECISION,
       category TEXT,
       source_platform TEXT,
+      view_count INTEGER DEFAULT 0,
+      share_count INTEGER DEFAULT 0,
       created_at TIMESTAMPTZ DEFAULT now()
     );
   `);
-  // Adds the column automatically if the table already existed
-  // from before this change, without losing existing data.
-  await pool.query(`
-    ALTER TABLE trending_posts ADD COLUMN IF NOT EXISTS source_platform TEXT;
-  `);
+  // Adds columns automatically if the table already existed from
+  // before, without losing any existing data.
+  await pool.query(`ALTER TABLE trending_posts ADD COLUMN IF NOT EXISTS source_platform TEXT;`);
+  await pool.query(`ALTER TABLE trending_posts ADD COLUMN IF NOT EXISTS view_count INTEGER DEFAULT 0;`);
+  await pool.query(`ALTER TABLE trending_posts ADD COLUMN IF NOT EXISTS share_count INTEGER DEFAULT 0;`);
   console.log('Database ready: trending_posts table exists.');
 }
 
