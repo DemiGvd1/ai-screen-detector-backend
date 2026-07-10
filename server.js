@@ -18,6 +18,76 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET;
 const HUGGINGFACE_API_KEY = process.env.HUGGINGFACE_API_KEY;
 const pdfParse = require('pdf-parse');
 const mammoth = require('mammoth');
+const ffmpegPath = require('ffmpeg-static');
+const { execFile } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+// All visual content (video uploads AND links) goes through Sightengine's
+// IMAGE detector, not their video detector — this keeps everything on
+// one provider (Sightengine) and avoids their paid-only video API.
+// We pull up to 5 still frames out of the video ourselves using ffmpeg
+// (a free tool), then run each frame through the same image detector
+// used by Photo scan, taking the highest score seen across frames.
+async function analyzeVideoFrames(videoBuffer) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frames-'));
+  const videoPath = path.join(tempDir, 'input.mp4');
+  fs.writeFileSync(videoPath, videoBuffer);
+  const framePattern = path.join(tempDir, 'frame-%02d.jpg');
+
+  try {
+    await new Promise((resolve, reject) => {
+      execFile(
+        ffmpegPath,
+        ['-i', videoPath, '-vf', 'fps=1/2', '-vframes', '5', framePattern],
+        (err) => (err ? reject(err) : resolve())
+      );
+    });
+
+    const frameFiles = fs.readdirSync(tempDir).filter((f) => f.startsWith('frame-'));
+    let aiScore = null;
+    let deepfakeScore = null;
+
+    // Check all frames at the same time instead of one after another —
+    // this is the main thing that was making video scans slow.
+    const frameResults = await Promise.all(
+      frameFiles.map(async (frameFile) => {
+        const frameBuffer = fs.readFileSync(path.join(tempDir, frameFile));
+        const form = new FormData();
+        form.append('media', frameBuffer, { filename: frameFile });
+        form.append('models', 'genai,deepfake');
+        form.append('api_user', SIGHTENGINE_API_USER);
+        form.append('api_secret', SIGHTENGINE_API_SECRET);
+
+        const response = await fetch('https://api.sightengine.com/1.0/check.json', {
+          method: 'POST',
+          body: form,
+        });
+        const data = await response.json();
+
+        if (data.status !== 'success') {
+          console.error('Sightengine rejected a frame:', data);
+          return { ai: null, deepfake: null };
+        }
+
+        return {
+          ai: data.type && typeof data.type.ai_generated === 'number' ? data.type.ai_generated : null,
+          deepfake: data.deepfake && typeof data.deepfake.score === 'number' ? data.deepfake.score : null,
+        };
+      })
+    );
+
+    for (const result of frameResults) {
+      if (result.ai !== null && (aiScore === null || result.ai > aiScore)) aiScore = result.ai;
+      if (result.deepfake !== null && (deepfakeScore === null || result.deepfake > deepfakeScore)) deepfakeScore = result.deepfake;
+    }
+
+    return { aiScore, deepfakeScore, frameCount: frameFiles.length };
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
 
 // Sends text to a free, open-source AI-text-detector model hosted on
 // Hugging Face, and returns a 0-1 "probability this is AI-written" score.
@@ -122,7 +192,7 @@ app.post('/analyze', uploadImage.single('image'), async (req, res) => {
       });
     }
     if (!SIGHTENGINE_API_USER || !SIGHTENGINE_API_SECRET) {
-      return res.status(500).json({ error: 'Server is missing its Sightengine credentials.' });
+      return res.status(500).json({ error: 'Server is missing its detection service credentials.' });
     }
 
     const form = new FormData();
@@ -138,7 +208,7 @@ app.post('/analyze', uploadImage.single('image'), async (req, res) => {
     const data = await sightengineResponse.json();
 
     if (data.status !== 'success') {
-      return res.status(502).json({ error: 'Sightengine returned an error', details: data });
+      return res.status(502).json({ error: 'The detection service returned an error', details: data });
     }
 
     const aiScore = data.type && typeof data.type.ai_generated === 'number' ? data.type.ai_generated : null;
@@ -157,7 +227,7 @@ app.post('/analyze', uploadImage.single('image'), async (req, res) => {
       flagged_by: top ? top.label : null,
       scores: { ai_generated: aiScore, deepfake: deepfakeScore },
       media_type: 'image',
-      source: 'sightengine',
+      source: 'internal',
     });
   } catch (err) {
     console.error('Error in /analyze:', err);
@@ -174,41 +244,10 @@ app.post('/analyze-video', uploadMedia.single('video'), async (req, res) => {
       });
     }
     if (!SIGHTENGINE_API_USER || !SIGHTENGINE_API_SECRET) {
-      return res.status(500).json({ error: 'Server is missing its Sightengine credentials.' });
+      return res.status(500).json({ error: 'Server is missing its detection service credentials.' });
     }
 
-    const form = new FormData();
-    form.append('media', req.file.buffer, { filename: 'clip.mp4' });
-    form.append('models', 'genai,deepfake');
-    form.append('api_user', SIGHTENGINE_API_USER);
-    form.append('api_secret', SIGHTENGINE_API_SECRET);
-
-    const sightengineResponse = await fetch('https://api.sightengine.com/1.0/video/check-sync.json', {
-      method: 'POST',
-      body: form,
-    });
-    const data = await sightengineResponse.json();
-
-    if (data.status !== 'success') {
-      return res.status(502).json({ error: 'Sightengine returned an error', details: data });
-    }
-
-    // Video results come back frame-by-frame. We take the single
-    // highest score seen across all frames as the overall verdict.
-    const frames = (data.data && data.data.frames) || [];
-    let aiScore = null;
-    let deepfakeScore = null;
-
-    for (const frame of frames) {
-      const frameAi = frame.type && frame.type.ai_generated;
-      const frameDeepfake = frame.deepfake && frame.deepfake.score;
-      if (typeof frameAi === 'number' && (aiScore === null || frameAi > aiScore)) aiScore = frameAi;
-      if (typeof frameDeepfake === 'number' && (deepfakeScore === null || frameDeepfake > deepfakeScore)) deepfakeScore = frameDeepfake;
-    }
-
-    // Fallback in case Sightengine returns a single top-level score instead.
-    if (aiScore === null && data.type) aiScore = data.type.ai_generated ?? null;
-    if (deepfakeScore === null && data.deepfake) deepfakeScore = data.deepfake.score ?? null;
+    const { aiScore, deepfakeScore } = await analyzeVideoFrames(req.file.buffer);
 
     const top = pickTopScore([
       { label: 'ai_generated', value: aiScore },
@@ -223,7 +262,7 @@ app.post('/analyze-video', uploadMedia.single('video'), async (req, res) => {
       flagged_by: top ? top.label : null,
       scores: { ai_generated: aiScore, deepfake: deepfakeScore },
       media_type: 'video',
-      source: 'sightengine',
+      source: 'internal',
     });
   } catch (err) {
     console.error('Error in /analyze-video:', err);
@@ -240,7 +279,7 @@ app.post('/analyze-audio', uploadMedia.single('audio'), async (req, res) => {
       });
     }
     if (!SIGHTENGINE_API_USER || !SIGHTENGINE_API_SECRET) {
-      return res.status(500).json({ error: 'Server is missing its Sightengine credentials.' });
+      return res.status(500).json({ error: 'Server is missing its detection service credentials.' });
     }
 
     const form = new FormData();
@@ -257,7 +296,7 @@ app.post('/analyze-audio', uploadMedia.single('audio'), async (req, res) => {
     const data = await sightengineResponse.json();
 
     if (data.status !== 'success') {
-      return res.status(502).json({ error: 'Sightengine returned an error', details: data });
+      return res.status(502).json({ error: 'The detection service returned an error', details: data });
     }
 
     const musicScore = data.type && typeof data.type.ai_generated === 'number' ? data.type.ai_generated : null;
@@ -276,7 +315,7 @@ app.post('/analyze-audio', uploadMedia.single('audio'), async (req, res) => {
       flagged_by: top ? top.label : null,
       scores: { ai_music: musicScore, ai_speech: speechScore },
       media_type: 'audio',
-      source: 'sightengine',
+      source: 'internal',
     });
   } catch (err) {
     console.error('Error in /analyze-audio:', err);
@@ -292,7 +331,7 @@ app.post('/analyze-text', async (req, res) => {
       return res.status(400).json({ error: 'Please provide at least a few sentences (50+ characters) to analyze.' });
     }
     if (!HUGGINGFACE_API_KEY) {
-      return res.status(500).json({ error: 'Server is missing its GPTZero credentials.' });
+      return res.status(500).json({ error: 'Server is missing its detection service credentials.' });
     }
 
     const score = await detectAIText(text);
@@ -302,10 +341,10 @@ app.post('/analyze-text', async (req, res) => {
       verdict,
       confidence,
       media_type: 'text',
-      source: 'huggingface',
+      source: 'internal',
     });
   } catch (err) {
-    console.error('Error in /analyze-text:', err);
+    console.error('Error in /analyze-text:', err.message, err.stack);
     res.status(500).json({ error: 'Something went wrong analyzing the text.' });
   }
 });
@@ -317,7 +356,7 @@ app.post('/analyze-document', uploadMedia.single('document'), async (req, res) =
       return res.status(400).json({ error: 'No document received. Send it as form-data under the field name "document".' });
     }
     if (!HUGGINGFACE_API_KEY) {
-      return res.status(500).json({ error: 'Server is missing its GPTZero credentials.' });
+      return res.status(500).json({ error: 'Server is missing its detection service credentials.' });
     }
 
     const filename = (req.file.originalname || '').toLowerCase();
@@ -346,7 +385,7 @@ app.post('/analyze-document', uploadMedia.single('document'), async (req, res) =
       verdict,
       confidence,
       media_type: 'document',
-      source: 'huggingface',
+      source: 'internal',
     });
   } catch (err) {
     console.error('Error in /analyze-document:', err);
@@ -355,10 +394,6 @@ app.post('/analyze-document', uploadMedia.single('document'), async (req, res) =
 });
 
 // ---------- LINK (TikTok / Instagram paste-a-link) ----------
-const { execFile } = require('child_process');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
 
 // Only these platforms are allowed — this stops people from pasting
 // random/unknown links, which could otherwise let someone misuse your
@@ -411,7 +446,7 @@ app.post('/analyze-link', async (req, res) => {
     });
   }
   if (!SIGHTENGINE_API_USER || !SIGHTENGINE_API_SECRET) {
-    return res.status(500).json({ error: 'Server is missing its Sightengine credentials.' });
+    return res.status(500).json({ error: 'Server is missing its detection service credentials.' });
   }
 
   const tempPath = path.join(os.tmpdir(), `link-${Date.now()}.mp4`);
@@ -424,34 +459,9 @@ app.post('/analyze-link', async (req, res) => {
 
     try {
       const videoBuffer = fs.readFileSync(tempPath);
+      fs.unlink(tempPath, () => { }); // clean up the temp file either way
 
-      const form = new FormData();
-      form.append('media', videoBuffer, { filename: 'link-video.mp4' });
-      form.append('models', 'genai,deepfake');
-      form.append('api_user', SIGHTENGINE_API_USER);
-      form.append('api_secret', SIGHTENGINE_API_SECRET);
-
-      const sightengineResponse = await fetch('https://api.sightengine.com/1.0/video/check-sync.json', {
-        method: 'POST',
-        body: form,
-      });
-      const data = await sightengineResponse.json();
-
-      fs.unlink(tempPath, () => {}); // clean up the temp file either way
-
-      if (data.status !== 'success') {
-        return res.status(502).json({ error: 'Sightengine returned an error', details: data });
-      }
-
-      const frames = (data.data && data.data.frames) || [];
-      let aiScore = null;
-      let deepfakeScore = null;
-      for (const frame of frames) {
-        const frameAi = frame.type && frame.type.ai_generated;
-        const frameDeepfake = frame.deepfake && frame.deepfake.score;
-        if (typeof frameAi === 'number' && (aiScore === null || frameAi > aiScore)) aiScore = frameAi;
-        if (typeof frameDeepfake === 'number' && (deepfakeScore === null || frameDeepfake > deepfakeScore)) deepfakeScore = frameDeepfake;
-      }
+      const { aiScore, deepfakeScore } = await analyzeVideoFrames(videoBuffer);
 
       const top = pickTopScore([
         { label: 'ai_generated', value: aiScore },
@@ -464,12 +474,12 @@ app.post('/analyze-link', async (req, res) => {
         confidence,
         flagged_by: top ? top.label : null,
         media_type: 'video',
-        source: 'sightengine',
+        source: 'internal',
         from_link: true,
       });
     } catch (processErr) {
       console.error('Error processing downloaded video:', processErr);
-      fs.unlink(tempPath, () => {});
+      fs.unlink(tempPath, () => { });
       res.status(500).json({ error: 'Downloaded the video but could not analyze it.' });
     }
   });
@@ -487,6 +497,40 @@ app.get('/trending', async (req, res) => {
   } catch (err) {
     console.error('Error in /trending:', err);
     res.status(500).json({ error: 'Could not load trending posts.' });
+  }
+});
+
+// Public — call when a post is opened, to count it as a view.
+app.post('/trending/:id/view', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'UPDATE trending_posts SET view_count = view_count + 1 WHERE id = $1 RETURNING view_count',
+      [req.params.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Post not found.' });
+    }
+    res.json({ view_count: result.rows[0].view_count });
+  } catch (err) {
+    console.error('Error in /trending/:id/view:', err);
+    res.status(500).json({ error: 'Could not record view.' });
+  }
+});
+
+// Public — call when a post is shared, to count it as a share.
+app.post('/trending/:id/share', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'UPDATE trending_posts SET share_count = share_count + 1 WHERE id = $1 RETURNING share_count',
+      [req.params.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Post not found.' });
+    }
+    res.json({ share_count: result.rows[0].share_count });
+  } catch (err) {
+    console.error('Error in /trending/:id/share:', err);
+    res.status(500).json({ error: 'Could not record share.' });
   }
 });
 
