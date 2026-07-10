@@ -29,6 +29,7 @@ async function initDB() {
   await pool.query(`ALTER TABLE trending_posts ADD COLUMN IF NOT EXISTS source_platform TEXT;`);
   await pool.query(`ALTER TABLE trending_posts ADD COLUMN IF NOT EXISTS view_count INTEGER DEFAULT 0;`);
   await pool.query(`ALTER TABLE trending_posts ADD COLUMN IF NOT EXISTS share_count INTEGER DEFAULT 0;`);
+  await pool.query(`ALTER TABLE trending_posts ADD COLUMN IF NOT EXISTS thumbnail_image BYTEA;`);
   console.log('Database ready: trending_posts table exists.');
 }
 

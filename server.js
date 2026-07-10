@@ -208,7 +208,7 @@ app.post('/analyze', uploadImage.single('image'), async (req, res) => {
     const data = await sightengineResponse.json();
 
     if (data.status !== 'success') {
-      return res.status(502).json({ error: 'The detection service returned an error', details: data });
+      return res.status(502).json({ error: 'Oops — Trace ran into a problem analyzing that. Please try again.', details: data });
     }
 
     const aiScore = data.type && typeof data.type.ai_generated === 'number' ? data.type.ai_generated : null;
@@ -231,7 +231,7 @@ app.post('/analyze', uploadImage.single('image'), async (req, res) => {
     });
   } catch (err) {
     console.error('Error in /analyze:', err);
-    res.status(500).json({ error: 'Something went wrong analyzing the image.' });
+    res.status(500).json({ error: "Oops — Trace couldn't finish that scan. Please try again." });
   }
 });
 
@@ -266,7 +266,7 @@ app.post('/analyze-video', uploadMedia.single('video'), async (req, res) => {
     });
   } catch (err) {
     console.error('Error in /analyze-video:', err);
-    res.status(500).json({ error: 'Something went wrong analyzing the video.' });
+    res.status(500).json({ error: "Oops — Trace couldn't finish that scan. Please try again." });
   }
 });
 
@@ -296,7 +296,7 @@ app.post('/analyze-audio', uploadMedia.single('audio'), async (req, res) => {
     const data = await sightengineResponse.json();
 
     if (data.status !== 'success') {
-      return res.status(502).json({ error: 'The detection service returned an error', details: data });
+      return res.status(502).json({ error: 'Oops — Trace ran into a problem analyzing that. Please try again.', details: data });
     }
 
     const musicScore = data.type && typeof data.type.ai_generated === 'number' ? data.type.ai_generated : null;
@@ -319,7 +319,7 @@ app.post('/analyze-audio', uploadMedia.single('audio'), async (req, res) => {
     });
   } catch (err) {
     console.error('Error in /analyze-audio:', err);
-    res.status(500).json({ error: 'Something went wrong analyzing the audio.' });
+    res.status(500).json({ error: "Oops — Trace couldn't finish that scan. Please try again." });
   }
 });
 
@@ -345,7 +345,7 @@ app.post('/analyze-text', async (req, res) => {
     });
   } catch (err) {
     console.error('Error in /analyze-text:', err.message, err.stack);
-    res.status(500).json({ error: 'Something went wrong analyzing the text.' });
+    res.status(500).json({ error: "Oops — Trace couldn't finish that scan. Please try again." });
   }
 });
 
@@ -389,7 +389,7 @@ app.post('/analyze-document', uploadMedia.single('document'), async (req, res) =
     });
   } catch (err) {
     console.error('Error in /analyze-document:', err);
-    res.status(500).json({ error: 'Something went wrong analyzing the document.' });
+    res.status(500).json({ error: "Oops — Trace couldn't finish that scan. Please try again." });
   }
 });
 
@@ -491,12 +491,75 @@ app.post('/analyze-link', async (req, res) => {
 app.get('/trending', async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT * FROM trending_posts ORDER BY created_at DESC LIMIT 50'
+      'SELECT id, title, video_url, thumbnail_url, ai_score, category, source_platform, view_count, share_count, created_at, (thumbnail_image IS NOT NULL) AS has_generated_thumbnail FROM trending_posts ORDER BY created_at DESC LIMIT 50'
     );
-    res.json(result.rows);
+    const posts = result.rows.map((row) => {
+      const post = { ...row };
+      if (row.has_generated_thumbnail) {
+        post.thumbnail_url = `https://ai-screen-detector-backend.onrender.com/trending/${row.id}/thumbnail`;
+      }
+      delete post.has_generated_thumbnail;
+      return post;
+    });
+    res.json(posts);
   } catch (err) {
     console.error('Error in /trending:', err);
     res.status(500).json({ error: 'Could not load trending posts.' });
+  }
+});
+
+// Public — serves the actual thumbnail image generated from the video.
+app.get('/trending/:id/thumbnail', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT thumbnail_image FROM trending_posts WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0 || !result.rows[0].thumbnail_image) {
+      return res.status(404).send('No thumbnail available.');
+    }
+    res.set('Content-Type', 'image/jpeg');
+    res.send(result.rows[0].thumbnail_image);
+  } catch (err) {
+    console.error('Error in /trending/:id/thumbnail:', err);
+    res.status(500).send('Could not load thumbnail.');
+  }
+});
+
+// Admin only — grabs a real frame from the post's video and stores it
+// as the thumbnail, using the same yt-dlp + ffmpeg tools as Link scan.
+app.post('/admin/trending/:id/generate-thumbnail', requireAdmin, async (req, res) => {
+  try {
+    const postResult = await pool.query('SELECT video_url FROM trending_posts WHERE id = $1', [req.params.id]);
+    if (postResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Post not found.' });
+    }
+    const videoUrl = postResult.rows[0].video_url;
+    const tempVideoPath = path.join(os.tmpdir(), `thumb-src-${Date.now()}.mp4`);
+    const tempFramePath = path.join(os.tmpdir(), `thumb-frame-${Date.now()}.jpg`);
+
+    await new Promise((resolve, reject) => {
+      execFile('./yt-dlp', ['-f', 'best[ext=mp4]/best', '-o', tempVideoPath, videoUrl], { timeout: 60000 }, (err) =>
+        err ? reject(err) : resolve()
+      );
+    });
+
+    await new Promise((resolve, reject) => {
+      execFile(ffmpegPath, ['-i', tempVideoPath, '-vframes', '1', '-q:v', '3', tempFramePath], (err) =>
+        err ? reject(err) : resolve()
+      );
+    });
+
+    const frameBuffer = fs.readFileSync(tempFramePath);
+    await pool.query('UPDATE trending_posts SET thumbnail_image = $1 WHERE id = $2', [frameBuffer, req.params.id]);
+
+    fs.unlink(tempVideoPath, () => {});
+    fs.unlink(tempFramePath, () => {});
+
+    res.json({
+      success: true,
+      thumbnail_url: `https://ai-screen-detector-backend.onrender.com/trending/${req.params.id}/thumbnail`,
+    });
+  } catch (err) {
+    console.error('Error in generate-thumbnail:', err);
+    res.status(500).json({ error: 'Could not generate thumbnail from that video.' });
   }
 });
 
