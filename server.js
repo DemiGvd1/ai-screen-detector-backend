@@ -459,7 +459,7 @@ app.post('/analyze-link', async (req, res) => {
 
     try {
       const videoBuffer = fs.readFileSync(tempPath);
-      fs.unlink(tempPath, () => { }); // clean up the temp file either way
+      fs.unlink(tempPath, () => {}); // clean up the temp file either way
 
       const { aiScore, deepfakeScore } = await analyzeVideoFrames(videoBuffer);
 
@@ -479,7 +479,7 @@ app.post('/analyze-link', async (req, res) => {
       });
     } catch (processErr) {
       console.error('Error processing downloaded video:', processErr);
-      fs.unlink(tempPath, () => { });
+      fs.unlink(tempPath, () => {});
       res.status(500).json({ error: 'Downloaded the video but could not analyze it.' });
     }
   });
