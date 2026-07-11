@@ -370,6 +370,52 @@ app.post('/analyze-video', uploadMedia.single('video'), async (req, res) => {
 });
 
 // ---------- AUDIO ----------
+const AUDIO_DETECTION_MODELS = [
+  'MelodyMachine/Deepfake-audio-detection-V2',
+  'mo-thecreator/Deepfake-audio-detection',
+];
+
+async function detectAIAudio(audioBuffer, modelIndex = 0, attempt = 1) {
+  if (modelIndex >= AUDIO_DETECTION_MODELS.length) {
+    return null;
+  }
+  const model = AUDIO_DETECTION_MODELS[modelIndex];
+  try {
+    const response = await fetch(`https://router.huggingface.co/hf-inference/models/${model}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${HUGGINGFACE_API_KEY}` },
+      body: audioBuffer,
+    });
+    const data = await response.json();
+
+    if (data.error && data.estimated_time) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(data.estimated_time * 1000, 15000)));
+      return detectAIAudio(audioBuffer, modelIndex, attempt);
+    }
+    if (data.error) {
+      console.error(`Audio model ${model} failed:`, data.error);
+      return detectAIAudio(audioBuffer, modelIndex + 1, 1);
+    }
+
+    const results = Array.isArray(data[0]) ? data[0] : data;
+    if (!Array.isArray(results)) return detectAIAudio(audioBuffer, modelIndex + 1, 1);
+
+    const fakeEntry = results.find((r) => /fake|spoof|synthetic|ai/i.test(r.label));
+    if (fakeEntry) return fakeEntry.score;
+
+    const realEntry = results.find((r) => /real|bonafide|genuine|human/i.test(r.label));
+    if (realEntry) return 1 - realEntry.score;
+
+    return results[0] ? results[0].score : null;
+  } catch (err) {
+    if (attempt < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      return detectAIAudio(audioBuffer, modelIndex, attempt + 1);
+    }
+    return detectAIAudio(audioBuffer, modelIndex + 1, 1);
+  }
+}
+
 app.post('/analyze-audio', uploadMedia.single('audio'), async (req, res) => {
   try {
     if (!req.file) {
@@ -377,42 +423,22 @@ app.post('/analyze-audio', uploadMedia.single('audio'), async (req, res) => {
         error: 'No audio received. Send it as form-data under the field name "audio".',
       });
     }
-    if (!SIGHTENGINE_API_USER || !SIGHTENGINE_API_SECRET) {
+    if (!HUGGINGFACE_API_KEY) {
       return res.status(500).json({ error: 'Server is missing its detection service credentials.' });
     }
 
-    const form = new FormData();
-    form.append('audio', req.file.buffer, { filename: 'clip.mp3' });
-    // genai catches AI-generated music, ai_speech catches AI-generated voice.
-    form.append('models', 'genai,ai_speech');
-    form.append('api_user', SIGHTENGINE_API_USER);
-    form.append('api_secret', SIGHTENGINE_API_SECRET);
-
-    const sightengineResponse = await fetch('https://api.sightengine.com/1.0/audio/check.json', {
-      method: 'POST',
-      body: form,
-    });
-    const data = await sightengineResponse.json();
-
-    if (data.status !== 'success') {
-      return res.status(502).json({ error: 'Oops! Trace ran into a problem analyzing that. Please try again.', details: data });
-    }
-
-    const musicScore = data.type && typeof data.type.ai_generated === 'number' ? data.type.ai_generated : null;
-    const speechScore = data.ai_speech && typeof data.ai_speech.score === 'number' ? data.ai_speech.score : null;
-
-    const top = pickTopScore([
-      { label: 'ai_music', value: musicScore },
-      { label: 'ai_speech', value: speechScore },
-    ]);
-
-    const { verdict, confidence } = scoreToVerdict(top ? top.value : null);
+    const score = await detectAIAudio(req.file.buffer);
+    const { verdict, confidence } = scoreToVerdict(score);
 
     res.json({
       verdict,
       confidence,
-      flagged_by: top ? top.label : null,
-      scores: { ai_music: musicScore, ai_speech: speechScore },
+      reason:
+        verdict === 'likely_ai'
+          ? 'Traced as AI-generated audio based on synthetic voice patterns.'
+          : verdict === 'likely_real'
+          ? 'Traced as real. No strong synthetic-voice signals were detected.'
+          : "Signals were mixed. Trace isn't confident enough to call this either way.",
       media_type: 'audio',
       source: 'internal',
     });
@@ -765,6 +791,143 @@ app.get('/admin/fetch-preview', requireAdmin, async (req, res) => {
     console.error('Error in /admin/fetch-preview:', err);
     res.status(500).json({ error: 'Could not fetch preview.' });
   }
+});
+
+// ---------- ADMIN DASHBOARD (simple webpage, no curl needed) ----------
+app.get('/admin', (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trace Admin</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 16px; background: #f5f5f5; }
+  h1 { font-size: 20px; }
+  input, select, button, textarea { width: 100%; padding: 10px; margin: 6px 0; box-sizing: border-box; border-radius: 8px; border: 1px solid #ccc; font-size: 15px; }
+  button { background: #007AFF; color: white; border: none; font-weight: 600; cursor: pointer; }
+  button:disabled { background: #aaa; }
+  .card { background: white; padding: 16px; border-radius: 12px; margin-bottom: 16px; }
+  .post { display: flex; gap: 10px; align-items: center; border-bottom: 1px solid #eee; padding: 10px 0; }
+  .post img { width: 60px; height: 60px; object-fit: cover; border-radius: 8px; background: #eee; }
+  .post-info { flex: 1; font-size: 13px; }
+  .delete-btn { background: #ff3b30; width: auto; padding: 6px 10px; font-size: 12px; }
+  #status { font-size: 13px; color: #666; margin-top: 6px; }
+</style>
+</head>
+<body>
+<h1>Trace Admin Dashboard</h1>
+
+<div class="card">
+  <label>Admin Password</label>
+  <input id="secret" type="password" placeholder="Your admin secret">
+
+  <label>TikTok Link</label>
+  <input id="linkUrl" type="text" placeholder="https://vt.tiktok.com/...">
+  <button onclick="fetchPreview()">1. Fetch Preview</button>
+
+  <label>Title</label>
+  <input id="title" type="text">
+  <label>Category</label>
+  <input id="category" type="text" placeholder="celebrity, scam, music...">
+  <label>Source Platform</label>
+  <select id="platform">
+    <option>TikTok</option>
+    <option>Instagram</option>
+    <option>Facebook</option>
+    <option>Twitter</option>
+  </select>
+  <label>AI Score (0.0 - 1.0)</label>
+  <input id="aiScore" type="text" placeholder="0.9">
+
+  <button onclick="createPost()">2. Create Post + Generate Thumbnail</button>
+  <div id="status"></div>
+</div>
+
+<div class="card">
+  <h2 style="font-size:16px;">Existing Posts</h2>
+  <div id="postList"></div>
+  <button onclick="loadPosts()" style="margin-top:10px;">Refresh List</button>
+</div>
+
+<script>
+function secret() { return document.getElementById('secret').value; }
+function setStatus(msg) { document.getElementById('status').innerText = msg; }
+
+async function fetchPreview() {
+  const url = document.getElementById('linkUrl').value;
+  if (!url) return alert('Paste a link first');
+  setStatus('Fetching preview...');
+  const res = await fetch('/admin/fetch-preview?url=' + encodeURIComponent(url), {
+    headers: { 'x-admin-secret': secret() }
+  });
+  const data = await res.json();
+  if (data.error) return setStatus('Error: ' + data.error);
+  document.getElementById('title').value = data.title || '';
+  document.getElementById('linkUrl').value = data.resolved_url || url;
+  setStatus('Preview loaded. Fill in the rest and create the post.');
+}
+
+async function createPost() {
+  setStatus('Creating post...');
+  const body = {
+    title: document.getElementById('title').value,
+    video_url: document.getElementById('linkUrl').value,
+    category: document.getElementById('category').value,
+    source_platform: document.getElementById('platform').value,
+    ai_score: parseFloat(document.getElementById('aiScore').value) || null
+  };
+  const res = await fetch('/admin/trending', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-admin-secret': secret() },
+    body: JSON.stringify(body)
+  });
+  const data = await res.json();
+  if (data.error) return setStatus('Error: ' + data.error);
+
+  setStatus('Post created. Generating thumbnail (can take up to a minute)...');
+  const thumbRes = await fetch('/admin/trending/' + data.id + '/generate-thumbnail', {
+    method: 'POST',
+    headers: { 'x-admin-secret': secret() }
+  });
+  const thumbData = await thumbRes.json();
+  if (thumbData.error) {
+    setStatus('Post created, but thumbnail failed: ' + thumbData.error);
+  } else {
+    setStatus('Done! Post and thumbnail created successfully.');
+  }
+  loadPosts();
+}
+
+async function loadPosts() {
+  const res = await fetch('/trending');
+  const posts = await res.json();
+  const list = document.getElementById('postList');
+  list.innerHTML = posts.map(p => \`
+    <div class="post">
+      <img src="\${p.thumbnail_url || ''}" onerror="this.style.display='none'">
+      <div class="post-info">
+        <strong>\${p.title}</strong><br>
+        \${p.source_platform || ''} · \${p.category || ''} · \${Math.round((p.ai_score||0)*100)}% AI
+      </div>
+      <button class="delete-btn" onclick="deletePost(\${p.id})">Delete</button>
+    </div>
+  \`).join('');
+}
+
+async function deletePost(id) {
+  if (!confirm('Delete this post?')) return;
+  await fetch('/admin/trending/' + id, {
+    method: 'DELETE',
+    headers: { 'x-admin-secret': secret() }
+  });
+  loadPosts();
+}
+
+loadPosts();
+</script>
+</body>
+</html>`);
 });
 
 const PORT = process.env.PORT || 3000;
