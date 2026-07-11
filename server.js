@@ -40,7 +40,7 @@ async function analyzeVideoFrames(videoBuffer) {
     await new Promise((resolve, reject) => {
       execFile(
         ffmpegPath,
-        ['-i', videoPath, '-vf', 'fps=1/2', '-vframes', '5', framePattern],
+        ['-i', videoPath, '-vf', 'fps=1/2,scale=480:-1', '-vframes', '5', framePattern],
         (err) => (err ? reject(err) : resolve())
       );
     });
@@ -113,7 +113,7 @@ async function detectAIText(text, modelIndex = 0, attempt = 1) {
   const model = TEXT_DETECTION_MODELS[modelIndex];
 
   try {
-    const response = await fetch(`https://api-inference.huggingface.co/models/${model}`, {
+    const response = await fetch(`https://router.huggingface.co/hf-inference/models/${model}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -157,10 +157,10 @@ async function detectAIText(text, modelIndex = 0, attempt = 1) {
 
 function reasonForTextVerdict(verdict, confidence) {
   if (verdict === 'likely_ai') {
-    return `Traced as AI-written — the style closely matches patterns common in AI-generated text (${Math.round(confidence * 100)}% match).`;
+    return `Traced as AI-written. The style closely matches patterns common in AI-generated text (${Math.round(confidence * 100)}% match).`;
   }
   if (verdict === 'likely_real') {
-    return `Traced as human-written — the style matches typical human writing patterns (${Math.round(confidence * 100)}% confidence).`;
+    return `Traced as human-written. The style matches typical human writing patterns (${Math.round(confidence * 100)}% confidence).`;
   }
   return "Signals were mixed — Trace isn't confident enough to call this either way.";
 }
@@ -221,7 +221,7 @@ function scoreToVerdict(score) {
 async function generateImageCaption(imageBuffer, attempt = 1) {
   try {
     const response = await fetch(
-      'https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-base',
+      'https://router.huggingface.co/hf-inference/models/Salesforce/blip-image-captioning-base',
       {
         method: 'POST',
         headers: { Authorization: `Bearer ${HUGGINGFACE_API_KEY}` },
@@ -255,10 +255,10 @@ async function generateImageCaption(imageBuffer, attempt = 1) {
 function reasonForVerdict(verdict, flaggedBy) {
   if (verdict === 'likely_ai') {
     if (flaggedBy === 'ai_generated') {
-      return "Traced as AI-generated — this closely matches patterns seen in fully AI-generated content.";
+      return "Traced as AI-generated. This closely matches patterns seen in fully AI-generated content.";
     }
     if (flaggedBy === 'deepfake') {
-      return "Traced as manipulated — signs of facial editing or a face-swap were found.";
+      return "Traced as manipulated. Signs of facial editing or a face-swap were found.";
     }
     if (flaggedBy === 'ai_music' || flaggedBy === 'ai_speech') {
       return "Traced as AI-generated audio based on synthetic voice patterns.";
@@ -266,7 +266,7 @@ function reasonForVerdict(verdict, flaggedBy) {
     return "Traced as AI-generated based on multiple signals.";
   }
   if (verdict === 'likely_real') {
-    return "Traced as real — no strong AI-generation or manipulation signals were detected.";
+    return "Traced as real. No strong AI-generation or manipulation signals were detected.";
   }
   return "Signals were mixed — Trace isn't confident enough to call this either way.";
 }
@@ -304,7 +304,7 @@ app.post('/analyze', uploadImage.single('image'), async (req, res) => {
     const data = await sightengineResponse.json();
 
     if (data.status !== 'success') {
-      return res.status(502).json({ error: 'Oops — Trace ran into a problem analyzing that. Please try again.', details: data });
+      return res.status(502).json({ error: 'Oops! Trace ran into a problem analyzing that. Please try again.', details: data });
     }
 
     const aiScore = data.type && typeof data.type.ai_generated === 'number' ? data.type.ai_generated : null;
@@ -329,7 +329,7 @@ app.post('/analyze', uploadImage.single('image'), async (req, res) => {
     });
   } catch (err) {
     console.error('Error in /analyze:', err);
-    res.status(500).json({ error: "Oops — Trace couldn't finish that scan. Please try again." });
+    res.status(500).json({ error: "Oops! Trace couldn't finish that scan. Please try again." });
   }
 });
 
@@ -365,7 +365,7 @@ app.post('/analyze-video', uploadMedia.single('video'), async (req, res) => {
     });
   } catch (err) {
     console.error('Error in /analyze-video:', err);
-    res.status(500).json({ error: "Oops — Trace couldn't finish that scan. Please try again." });
+    res.status(500).json({ error: "Oops! Trace couldn't finish that scan. Please try again." });
   }
 });
 
@@ -395,7 +395,7 @@ app.post('/analyze-audio', uploadMedia.single('audio'), async (req, res) => {
     const data = await sightengineResponse.json();
 
     if (data.status !== 'success') {
-      return res.status(502).json({ error: 'Oops — Trace ran into a problem analyzing that. Please try again.', details: data });
+      return res.status(502).json({ error: 'Oops! Trace ran into a problem analyzing that. Please try again.', details: data });
     }
 
     const musicScore = data.type && typeof data.type.ai_generated === 'number' ? data.type.ai_generated : null;
@@ -418,7 +418,7 @@ app.post('/analyze-audio', uploadMedia.single('audio'), async (req, res) => {
     });
   } catch (err) {
     console.error('Error in /analyze-audio:', err);
-    res.status(500).json({ error: "Oops — Trace couldn't finish that scan. Please try again." });
+    res.status(500).json({ error: "Oops! Trace couldn't finish that scan. Please try again." });
   }
 });
 
@@ -445,7 +445,7 @@ app.post('/analyze-text', async (req, res) => {
     });
   } catch (err) {
     console.error('Error in /analyze-text:', err.message, err.stack);
-    res.status(500).json({ error: "Oops — Trace couldn't finish that scan. Please try again." });
+    res.status(500).json({ error: "Oops! Trace couldn't finish that scan. Please try again." });
   }
 });
 
@@ -489,7 +489,7 @@ app.post('/analyze-document', uploadMedia.single('document'), async (req, res) =
     });
   } catch (err) {
     console.error('Error in /analyze-document:', err);
-    res.status(500).json({ error: "Oops — Trace couldn't finish that scan. Please try again." });
+    res.status(500).json({ error: "Oops! Trace couldn't finish that scan. Please try again." });
   }
 });
 
@@ -551,7 +551,7 @@ app.post('/analyze-link', async (req, res) => {
 
   const tempPath = path.join(os.tmpdir(), `link-${Date.now()}.mp4`);
 
-  execFile('./yt-dlp', ['-f', 'best[ext=mp4]/best', '-o', tempPath, url], { timeout: 60000 }, async (err) => {
+  execFile('./yt-dlp', ['-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst', '-o', tempPath, url], { timeout: 60000 }, async (err) => {
     if (err) {
       console.error('yt-dlp error:', err);
       return res.status(502).json({ error: 'Could not download that link. It may be private, region-locked, or an unsupported platform.' });
@@ -638,7 +638,7 @@ app.post('/admin/trending/:id/generate-thumbnail', requireAdmin, async (req, res
     const tempFramePath = path.join(os.tmpdir(), `thumb-frame-${Date.now()}.jpg`);
 
     await new Promise((resolve, reject) => {
-      execFile('./yt-dlp', ['-f', 'best[ext=mp4]/best', '-o', tempVideoPath, videoUrl], { timeout: 60000 }, (err) =>
+      execFile('./yt-dlp', ['-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst', '-o', tempVideoPath, videoUrl], { timeout: 60000 }, (err) =>
         err ? reject(err) : resolve()
       );
     });
