@@ -70,49 +70,57 @@ async function analyzeVideoFrames(videoBuffer) {
     let aiScore = null;
     let deepfakeScore = null;
 
+    // Grab the first frame as a reusable thumbnail (base64) so callers
+    // like Link scan can save it to history without a second download —
+    // and also caption it, same as Photo scan, so video results can say
+    // what's actually in the clip instead of just a verdict.
+    let thumbnailBase64 = null;
+    let firstFrameBuffer = null;
+    if (frameFiles.length > 0) {
+      firstFrameBuffer = fs.readFileSync(path.join(tempDir, frameFiles[0]));
+      thumbnailBase64 = firstFrameBuffer.toString('base64');
+    }
+
     // Check all frames at the same time instead of one after another —
-    // this is the main thing that was making video scans slow.
-    const frameResults = await Promise.all(
-      frameFiles.map(async (frameFile) => {
-        const frameBuffer = fs.readFileSync(path.join(tempDir, frameFile));
-        const form = new FormData();
-        form.append('media', frameBuffer, { filename: frameFile });
-        form.append('models', 'genai,deepfake');
-        form.append('api_user', SIGHTENGINE_API_USER);
-        form.append('api_secret', SIGHTENGINE_API_SECRET);
+    // this is the main thing that was making video scans slow. Captioning
+    // the first frame happens alongside it, not after, so it doesn't add
+    // extra wait time.
+    const [frameResults, caption] = await Promise.all([
+      Promise.all(
+        frameFiles.map(async (frameFile) => {
+          const frameBuffer = fs.readFileSync(path.join(tempDir, frameFile));
+          const form = new FormData();
+          form.append('media', frameBuffer, { filename: frameFile });
+          form.append('models', 'genai,deepfake');
+          form.append('api_user', SIGHTENGINE_API_USER);
+          form.append('api_secret', SIGHTENGINE_API_SECRET);
 
-        const response = await fetch('https://api.sightengine.com/1.0/check.json', {
-          method: 'POST',
-          body: form,
-        });
-        const data = await response.json();
+          const response = await fetch('https://api.sightengine.com/1.0/check.json', {
+            method: 'POST',
+            body: form,
+          });
+          const data = await response.json();
 
-        if (data.status !== 'success') {
-          console.error('Sightengine rejected a frame:', data);
-          return { ai: null, deepfake: null };
-        }
+          if (data.status !== 'success') {
+            console.error('Sightengine rejected a frame:', data);
+            return { ai: null, deepfake: null };
+          }
 
-        return {
-          ai: data.type && typeof data.type.ai_generated === 'number' ? data.type.ai_generated : null,
-          deepfake: data.deepfake && typeof data.deepfake.score === 'number' ? data.deepfake.score : null,
-        };
-      })
-    );
+          return {
+            ai: data.type && typeof data.type.ai_generated === 'number' ? data.type.ai_generated : null,
+            deepfake: data.deepfake && typeof data.deepfake.score === 'number' ? data.deepfake.score : null,
+          };
+        })
+      ),
+      firstFrameBuffer ? generateImageCaption(firstFrameBuffer) : Promise.resolve(null),
+    ]);
 
     for (const result of frameResults) {
       if (result.ai !== null && (aiScore === null || result.ai > aiScore)) aiScore = result.ai;
       if (result.deepfake !== null && (deepfakeScore === null || result.deepfake > deepfakeScore)) deepfakeScore = result.deepfake;
     }
 
-    // Grab the first frame as a reusable thumbnail (base64) so callers
-    // like Link scan can save it to history without a second download.
-    let thumbnailBase64 = null;
-    if (frameFiles.length > 0) {
-      const firstFrameBuffer = fs.readFileSync(path.join(tempDir, frameFiles[0]));
-      thumbnailBase64 = firstFrameBuffer.toString('base64');
-    }
-
-    return { aiScore, deepfakeScore, frameCount: frameFiles.length, thumbnailBase64 };
+    return { aiScore, deepfakeScore, frameCount: frameFiles.length, thumbnailBase64, caption };
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -285,24 +293,43 @@ async function generateImageCaption(imageBuffer, attempt = 1) {
   }
 }
 
+function withSubject(caption, sentence) {
+  if (!caption) return sentence;
+  const capped = caption.charAt(0).toUpperCase() + caption.slice(1);
+  return `${capped}. ${sentence}`;
+}
+
 // Turns real detector signals into a plain-English explanation. This
-// never invents specific visual details — only describes which real
-// signal (if any) triggered, based on actual scores we have.
-function reasonForVerdict(verdict, flaggedBy) {
+// never invents specific visual details about the actual image/video (we
+// don't get that from Sightengine — it only gives us a score, not which
+// pixels triggered it). What it does do: name what's actually in frame
+// (from the captioning model, when available) and explain, generically
+// but honestly, what these detectors are known to key on — not "this
+// image has fake skin" (a claim we can't back up), but "these models
+// typically catch things like unnatural texture, warped fine detail,
+// or inconsistent lighting" (true of the detector, not asserted of this
+// specific frame).
+function reasonForVerdict(verdict, flaggedBy, caption) {
   if (verdict === 'likely_ai') {
     if (flaggedBy === 'ai_generated') {
-      return "Traced as AI-generated. This closely matches patterns seen in fully AI-generated content.";
+      return withSubject(
+        caption,
+        "Traced as AI-generated — flagged strongly by our AI-generation detector, the kind of match these models make when they pick up on unnatural skin or hair texture, inconsistent lighting and shadows, warped background detail, or irregular hands and fine detail that generators still struggle to get right."
+      );
     }
     if (flaggedBy === 'deepfake') {
-      return "Traced as manipulated. Signs of facial editing or a face-swap were found.";
+      return withSubject(
+        caption,
+        "Traced as manipulated — signs of facial editing or a face-swap were found, the kind of thing that usually shows up as a mismatched skin tone at the edge of the face, unnatural blinking or mouth movement, or soft blurring where the swapped face meets the original footage."
+      );
     }
     if (flaggedBy === 'ai_music' || flaggedBy === 'ai_speech') {
-      return "Traced as AI-generated audio based on synthetic voice patterns.";
+      return "Traced as AI-generated audio based on synthetic voice patterns — a flatter pitch range and unnaturally even pacing than real speech typically has.";
     }
-    return "Traced as AI-generated based on multiple signals.";
+    return withSubject(caption, "Traced as AI-generated based on multiple signals.");
   }
   if (verdict === 'likely_real') {
-    return "Traced as real. No strong AI-generation or manipulation signals were detected.";
+    return withSubject(caption, "Traced as real — no strong AI-generation or manipulation signals were detected.");
   }
   return "Signals were mixed — Trace isn't confident enough to call this either way.";
 }
@@ -357,7 +384,7 @@ app.post('/analyze', scanLimiter, uploadImage.single('image'), async (req, res) 
       verdict,
       confidence,
       caption,
-      reason: reasonForVerdict(verdict, top ? top.label : null),
+      reason: reasonForVerdict(verdict, top ? top.label : null, caption),
       flagged_by: top ? top.label : null,
       scores: { ai_generated: aiScore, deepfake: deepfakeScore },
       media_type: 'image',
@@ -381,7 +408,7 @@ app.post('/analyze-video', scanLimiter, uploadMedia.single('video'), async (req,
       return res.status(500).json({ error: 'Server is missing its detection service credentials.' });
     }
 
-    const { aiScore, deepfakeScore } = await analyzeVideoFrames(req.file.buffer);
+    const { aiScore, deepfakeScore, caption } = await analyzeVideoFrames(req.file.buffer);
 
     const top = pickTopScore([
       { label: 'ai_generated', value: aiScore },
@@ -393,7 +420,8 @@ app.post('/analyze-video', scanLimiter, uploadMedia.single('video'), async (req,
     res.json({
       verdict,
       confidence,
-      reason: reasonForVerdict(verdict, top ? top.label : null),
+      caption,
+      reason: reasonForVerdict(verdict, top ? top.label : null, caption),
       flagged_by: top ? top.label : null,
       scores: { ai_generated: aiScore, deepfake: deepfakeScore },
       media_type: 'video',
@@ -648,7 +676,7 @@ app.post('/analyze-link', scanLimiter, async (req, res) => {
       const videoBuffer = fs.readFileSync(tempPath);
       fs.unlink(tempPath, () => {}); // clean up the temp file either way
 
-      const { aiScore, deepfakeScore, thumbnailBase64 } = await analyzeVideoFrames(videoBuffer);
+      const { aiScore, deepfakeScore, thumbnailBase64, caption } = await analyzeVideoFrames(videoBuffer);
 
       const top = pickTopScore([
         { label: 'ai_generated', value: aiScore },
@@ -659,7 +687,8 @@ app.post('/analyze-link', scanLimiter, async (req, res) => {
       res.json({
         verdict,
         confidence,
-        reason: reasonForVerdict(verdict, top ? top.label : null),
+        caption,
+        reason: reasonForVerdict(verdict, top ? top.label : null, caption),
         flagged_by: top ? top.label : null,
         media_type: 'video',
         source: 'internal',
@@ -887,6 +916,8 @@ app.get('/admin', requireAdminBasicAuth, (req, res) => {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Trace Admin</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.js"></script>
 <style>
   body { font-family: -apple-system, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 16px; background: #f5f5f5; }
   h1 { font-size: 20px; }
@@ -901,6 +932,13 @@ app.get('/admin', requireAdminBasicAuth, (req, res) => {
   #status, #profileStatus { font-size: 13px; color: #666; margin-top: 6px; }
   .type-tag { display: inline-block; font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; background: #eee; color: #666; margin-left: 6px; }
   h2 { font-size: 16px; margin-top: 0; }
+  #cropperContainer { display: none; margin-top: 10px; }
+  #cropperImageWrap { max-height: 320px; overflow: hidden; background: #000; border-radius: 8px; }
+  #cropperImage { display: block; max-width: 100%; }
+  .crop-actions { display: flex; gap: 8px; }
+  .crop-actions button { width: auto; flex: 1; }
+  #cropPreviewWrap { display: none; align-items: center; gap: 10px; margin-top: 8px; }
+  #cropPreview { width: 50px; height: 50px; object-fit: cover; border-radius: 8px; }
 </style>
 </head>
 <body>
@@ -958,6 +996,21 @@ app.get('/admin', requireAdminBasicAuth, (req, res) => {
 
   <label>Screenshot of the profile</label>
   <input id="profileScreenshot" type="file" accept="image/*">
+
+  <div id="cropperContainer">
+    <div id="cropperImageWrap">
+      <img id="cropperImage">
+    </div>
+    <div class="crop-actions">
+      <button onclick="applyCrop()">Apply Crop</button>
+      <button onclick="cancelCrop()" style="background:#8e8e93;">Cancel</button>
+    </div>
+  </div>
+
+  <div id="cropPreviewWrap">
+    <img id="cropPreview">
+    <span style="font-size:13px;color:#666;">Cropped — this is what will upload.</span>
+  </div>
 
   <button onclick="createProfilePost()">Create Profile Post</button>
   <div id="profileStatus"></div>
@@ -1018,10 +1071,52 @@ async function createPost() {
   loadPosts();
 }
 
+let cropper = null;
+let croppedScreenshotBlob = null;
+
+document.getElementById('profileScreenshot').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  croppedScreenshotBlob = null;
+  document.getElementById('cropPreviewWrap').style.display = 'none';
+  if (!file) return;
+
+  const reader = new FileReader();
+  reader.onload = (evt) => {
+    const img = document.getElementById('cropperImage');
+    img.src = evt.target.result;
+    document.getElementById('cropperContainer').style.display = 'block';
+    if (cropper) cropper.destroy();
+    cropper = new Cropper(img, { viewMode: 1, autoCropArea: 1, background: false });
+  };
+  reader.readAsDataURL(file);
+});
+
+function applyCrop() {
+  if (!cropper) return;
+  cropper.getCroppedCanvas().toBlob((blob) => {
+    croppedScreenshotBlob = blob;
+    document.getElementById('cropPreview').src = URL.createObjectURL(blob);
+    document.getElementById('cropPreviewWrap').style.display = 'flex';
+    cropper.destroy();
+    cropper = null;
+    document.getElementById('cropperContainer').style.display = 'none';
+  }, 'image/jpeg', 0.92);
+}
+
+function cancelCrop() {
+  if (cropper) { cropper.destroy(); cropper = null; }
+  document.getElementById('cropperContainer').style.display = 'none';
+  document.getElementById('profileScreenshot').value = '';
+  croppedScreenshotBlob = null;
+  document.getElementById('cropPreviewWrap').style.display = 'none';
+}
+
 async function createProfilePost() {
   const setProfileStatus = (msg) => document.getElementById('profileStatus').innerText = msg;
   const fileInput = document.getElementById('profileScreenshot');
-  if (!fileInput.files[0]) return alert('Choose a screenshot image first');
+  const screenshotToUpload = croppedScreenshotBlob || fileInput.files[0];
+  if (!screenshotToUpload) return alert('Choose a screenshot image first');
+  if (cropper) return alert('Click "Apply Crop" (or "Cancel") before creating the post.');
 
   setProfileStatus('Creating profile post...');
   const form = new FormData();
@@ -1031,7 +1126,7 @@ async function createProfilePost() {
   form.append('category', document.getElementById('profileCategory').value);
   form.append('source_platform', document.getElementById('profilePlatform').value);
   form.append('ai_score', parseFloat(document.getElementById('profileAiScore').value) || '');
-  form.append('screenshot', fileInput.files[0]);
+  form.append('screenshot', screenshotToUpload, 'screenshot.jpg');
 
   const res = await fetch('/admin/trending/profile', {
     method: 'POST',
@@ -1048,6 +1143,8 @@ async function createProfilePost() {
   document.getElementById('profileCategory').value = '';
   document.getElementById('profileAiScore').value = '';
   fileInput.value = '';
+  croppedScreenshotBlob = null;
+  document.getElementById('cropPreviewWrap').style.display = 'none';
   loadPosts();
 }
 
