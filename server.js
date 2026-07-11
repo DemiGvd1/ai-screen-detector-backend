@@ -933,7 +933,7 @@ app.get('/admin', requireAdminBasicAuth, (req, res) => {
   .type-tag { display: inline-block; font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; background: #eee; color: #666; margin-left: 6px; }
   h2 { font-size: 16px; margin-top: 0; }
   #cropperContainer { display: none; margin-top: 10px; }
-  #cropperImageWrap { max-height: 320px; overflow: hidden; background: #000; border-radius: 8px; }
+  #cropperImageWrap { max-height: 65vh; overflow: hidden; background: #000; border-radius: 8px; }
   #cropperImage { display: block; max-width: 100%; }
   .crop-actions { display: flex; gap: 8px; }
   .crop-actions button { width: auto; flex: 1; }
