@@ -7,12 +7,33 @@ const express = require('express');
 const multer = require('multer');
 const fetch = require('node-fetch');
 const FormData = require('form-data');
+const rateLimit = require('express-rate-limit');
 const { pool, initDB } = require('./db');
 
 const app = express();
 app.use(express.json());
 
 initDB().catch((err) => console.error('Database setup failed:', err));
+
+// Scans hit paid/rate-limited third-party APIs (Sightengine, Hugging Face)
+// and, for video/link, spawn ffmpeg/yt-dlp — cap how often one client can
+// trigger them so a single caller can't burn through quota or CPU.
+const scanLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many scans from this device. Please wait a few minutes and try again.' },
+});
+
+// Lighter cap for cheap, frequently-polled public routes.
+const publicLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please try again shortly.' },
+});
 
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 const HUGGINGFACE_API_KEY = process.env.HUGGINGFACE_API_KEY;
@@ -176,6 +197,21 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+// Same gate, but for the dashboard's initial page load — browsers can't
+// attach a custom x-admin-secret header to a plain navigation, so this
+// uses HTTP Basic Auth instead (the browser prompts for it natively).
+// Username is ignored; the password is checked against ADMIN_SECRET.
+function requireAdminBasicAuth(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  if (ADMIN_SECRET && authHeader && authHeader.startsWith('Basic ')) {
+    const decoded = Buffer.from(authHeader.slice('Basic '.length), 'base64').toString('utf-8');
+    const password = decoded.slice(decoded.indexOf(':') + 1);
+    if (password === ADMIN_SECRET) return next();
+  }
+  res.set('WWW-Authenticate', 'Basic realm="Trace Admin"');
+  return res.status(401).send('Unauthorized');
+}
+
 // Photos are small. Videos and audio clips are bigger, so they get
 // their own upload limit.
 const uploadImage = multer({
@@ -278,7 +314,7 @@ function pickTopScore(entries) {
 }
 
 // ---------- PHOTOS ----------
-app.post('/analyze', uploadImage.single('image'), async (req, res) => {
+app.post('/analyze', scanLimiter, uploadImage.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({
@@ -334,7 +370,7 @@ app.post('/analyze', uploadImage.single('image'), async (req, res) => {
 });
 
 // ---------- VIDEO ----------
-app.post('/analyze-video', uploadMedia.single('video'), async (req, res) => {
+app.post('/analyze-video', scanLimiter, uploadMedia.single('video'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({
@@ -416,7 +452,7 @@ async function detectAIAudio(audioBuffer, modelIndex = 0, attempt = 1) {
   }
 }
 
-app.post('/analyze-audio', uploadMedia.single('audio'), async (req, res) => {
+app.post('/analyze-audio', scanLimiter, uploadMedia.single('audio'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({
@@ -449,7 +485,7 @@ app.post('/analyze-audio', uploadMedia.single('audio'), async (req, res) => {
 });
 
 // ---------- TEXT ----------
-app.post('/analyze-text', async (req, res) => {
+app.post('/analyze-text', scanLimiter, async (req, res) => {
   try {
     const { text } = req.body;
     if (!text || text.trim().length < 50) {
@@ -476,7 +512,7 @@ app.post('/analyze-text', async (req, res) => {
 });
 
 // ---------- DOCUMENTS (PDF / Word) ----------
-app.post('/analyze-document', uploadMedia.single('document'), async (req, res) => {
+app.post('/analyze-document', scanLimiter, uploadMedia.single('document'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No document received. Send it as form-data under the field name "document".' });
@@ -544,6 +580,24 @@ function isAllowedSocialLink(rawUrl) {
   }
 }
 
+// Short links (vt.tiktok.com/xxx) redirect before yt-dlp ever sees them.
+// Follow that redirect ourselves first and re-check the allowlist against
+// where it actually lands, so a link that starts on an allowed domain but
+// redirects elsewhere can't reach yt-dlp (which runs on our own server).
+// Best-effort: if resolution itself fails, fall through and let yt-dlp
+// (which only recognizes a handful of extractors) be the final gate.
+async function resolveLinkForDownload(rawUrl) {
+  try {
+    const response = await fetch(rawUrl, { method: 'GET', redirect: 'follow', timeout: 8000 });
+    const resolvedUrl = response.url || rawUrl;
+    if (!isAllowedSocialLink(resolvedUrl)) return null;
+    return resolvedUrl;
+  } catch (err) {
+    console.error('Link redirect resolution failed, proceeding with original URL:', err.message);
+    return rawUrl;
+  }
+}
+
 // Admin only — quick way to check if the yt-dlp tool actually got
 // installed during the build, without running the full link analysis.
 app.get('/admin/check-ytdlp', requireAdmin, (req, res) => {
@@ -561,7 +615,7 @@ app.get('/admin/check-ytdlp', requireAdmin, (req, res) => {
   });
 });
 
-app.post('/analyze-link', async (req, res) => {
+app.post('/analyze-link', scanLimiter, async (req, res) => {
   const { url } = req.body;
   if (!url) {
     return res.status(400).json({ error: 'Provide a "url" to analyze.' });
@@ -575,9 +629,16 @@ app.post('/analyze-link', async (req, res) => {
     return res.status(500).json({ error: 'Server is missing its detection service credentials.' });
   }
 
+  const resolvedUrl = await resolveLinkForDownload(url);
+  if (!resolvedUrl) {
+    return res.status(400).json({
+      error: 'That link redirects somewhere Trace doesn\'t recognize as a supported platform.',
+    });
+  }
+
   const tempPath = path.join(os.tmpdir(), `link-${Date.now()}.mp4`);
 
-  execFile('./yt-dlp', ['-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst', '-o', tempPath, url], { timeout: 60000 }, async (err) => {
+  execFile('./yt-dlp', ['-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst', '-o', tempPath, resolvedUrl], { timeout: 60000 }, async (err) => {
     if (err) {
       console.error('yt-dlp error:', err);
       return res.status(502).json({ error: 'Could not download that link. It may be private, region-locked, or an unsupported platform.' });
@@ -616,7 +677,7 @@ app.post('/analyze-link', async (req, res) => {
 // ---------- TRENDING FEED ----------
 
 // Public — the app calls this to load the scrollable feed.
-app.get('/trending', async (req, res) => {
+app.get('/trending', publicLimiter, async (req, res) => {
   try {
     const result = await pool.query(
       'SELECT id, title, video_url, thumbnail_url, ai_score, category, source_platform, view_count, share_count, created_at, (thumbnail_image IS NOT NULL) AS has_generated_thumbnail FROM trending_posts ORDER BY created_at DESC LIMIT 50'
@@ -637,7 +698,7 @@ app.get('/trending', async (req, res) => {
 });
 
 // Public — serves the actual thumbnail image generated from the video.
-app.get('/trending/:id/thumbnail', async (req, res) => {
+app.get('/trending/:id/thumbnail', publicLimiter, async (req, res) => {
   try {
     const result = await pool.query('SELECT thumbnail_image FROM trending_posts WHERE id = $1', [req.params.id]);
     if (result.rows.length === 0 || !result.rows[0].thumbnail_image) {
@@ -692,7 +753,7 @@ app.post('/admin/trending/:id/generate-thumbnail', requireAdmin, async (req, res
 });
 
 // Public — call when a post is opened, to count it as a view.
-app.post('/trending/:id/view', async (req, res) => {
+app.post('/trending/:id/view', publicLimiter, async (req, res) => {
   try {
     const result = await pool.query(
       'UPDATE trending_posts SET view_count = view_count + 1 WHERE id = $1 RETURNING view_count',
@@ -709,7 +770,7 @@ app.post('/trending/:id/view', async (req, res) => {
 });
 
 // Public — call when a post is shared, to count it as a share.
-app.post('/trending/:id/share', async (req, res) => {
+app.post('/trending/:id/share', publicLimiter, async (req, res) => {
   try {
     const result = await pool.query(
       'UPDATE trending_posts SET share_count = share_count + 1 WHERE id = $1 RETURNING share_count',
@@ -794,7 +855,7 @@ app.get('/admin/fetch-preview', requireAdmin, async (req, res) => {
 });
 
 // ---------- ADMIN DASHBOARD (simple webpage, no curl needed) ----------
-app.get('/admin', (req, res) => {
+app.get('/admin', requireAdminBasicAuth, (req, res) => {
   res.send(`<!DOCTYPE html>
 <html>
 <head>

@@ -81,18 +81,22 @@ Render deploys by connecting to a GitHub repository.
 - Click **New +** → **Web Service**.
 - Connect your GitHub account, select the `ai-screen-detector-backend` repo.
 - Render will detect it's a Node app. Set:
-  - **Build Command:** `npm install`
+  - **Build Command:** `bash build.sh` (not just `npm install` — this also downloads the `yt-dlp` binary that Link scan and the admin thumbnail generator need; see `build.sh` and `render.yaml`)
   - **Start Command:** `npm start`
   - **Instance Type:** Free
 - Click **Create Web Service**.
+- If you already have a service running with `npm install` as its Build Command, update it to `bash build.sh` in the Render dashboard (Settings → Build Command) and trigger a manual redeploy — otherwise yt-dlp only exists on that instance because someone installed it by hand, and it'll vanish on the next redeploy.
 
 ### 3. Add your secret key
 This is the important part — your `.env` file never got uploaded to GitHub (good, it shouldn't), so Render doesn't have your Sightengine key yet.
 - In the Render dashboard for your new service, go to **Environment**.
-- Add two environment variables:
-  - `SIGHTENGINE_API_USER` → your real value
-  - `SIGHTENGINE_API_SECRET` → your real value
-- Save — Render will redeploy automatically with the key available.
+- Add these environment variables (see `.env.example` for what each one is):
+  - `SIGHTENGINE_API_USER`
+  - `SIGHTENGINE_API_SECRET`
+  - `HUGGINGFACE_API_KEY`
+  - `DATABASE_URL`
+  - `ADMIN_SECRET`
+- Save — Render will redeploy automatically with the keys available.
 
 ### 4. Get your public URL
 Once deployed, Render shows you a URL like:
