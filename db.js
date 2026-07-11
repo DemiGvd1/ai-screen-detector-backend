@@ -30,6 +30,11 @@ async function initDB() {
   await pool.query(`ALTER TABLE trending_posts ADD COLUMN IF NOT EXISTS view_count INTEGER DEFAULT 0;`);
   await pool.query(`ALTER TABLE trending_posts ADD COLUMN IF NOT EXISTS share_count INTEGER DEFAULT 0;`);
   await pool.query(`ALTER TABLE trending_posts ADD COLUMN IF NOT EXISTS thumbnail_image BYTEA;`);
+  // 'video' (existing link-to-a-video posts) or 'profile' (an Instagram/
+  // TikTok account, e.g. a suspected AI influencer, linked by profile URL
+  // with an admin-uploaded screenshot instead of an extracted video frame).
+  await pool.query(`ALTER TABLE trending_posts ADD COLUMN IF NOT EXISTS post_type TEXT NOT NULL DEFAULT 'video';`);
+  await pool.query(`ALTER TABLE trending_posts ADD COLUMN IF NOT EXISTS description TEXT;`);
   console.log('Database ready: trending_posts table exists.');
 }
 

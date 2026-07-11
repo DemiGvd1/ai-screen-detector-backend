@@ -680,7 +680,7 @@ app.post('/analyze-link', scanLimiter, async (req, res) => {
 app.get('/trending', publicLimiter, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, title, video_url, thumbnail_url, ai_score, category, source_platform, view_count, share_count, created_at, (thumbnail_image IS NOT NULL) AS has_generated_thumbnail FROM trending_posts ORDER BY created_at DESC LIMIT 50'
+      'SELECT id, title, video_url, thumbnail_url, ai_score, category, source_platform, post_type, description, view_count, share_count, created_at, (thumbnail_image IS NOT NULL) AS has_generated_thumbnail FROM trending_posts ORDER BY created_at DESC LIMIT 50'
     );
     const posts = result.rows.map((row) => {
       const post = { ...row };
@@ -786,22 +786,47 @@ app.post('/trending/:id/share', publicLimiter, async (req, res) => {
   }
 });
 
-// Admin only — adds a new post to the feed.
+// Admin only — adds a new video post to the feed.
 app.post('/admin/trending', requireAdmin, async (req, res) => {
-  const { title, video_url, thumbnail_url, ai_score, category, source_platform } = req.body;
+  const { title, video_url, thumbnail_url, ai_score, category, source_platform, description } = req.body;
   if (!title || !video_url) {
     return res.status(400).json({ error: 'title and video_url are required.' });
   }
   try {
     const result = await pool.query(
-      `INSERT INTO trending_posts (title, video_url, thumbnail_url, ai_score, category, source_platform)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [title, video_url, thumbnail_url || null, ai_score || null, category || null, source_platform || null]
+      `INSERT INTO trending_posts (title, video_url, thumbnail_url, ai_score, category, source_platform, description, post_type)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'video') RETURNING *`,
+      [title, video_url, thumbnail_url || null, ai_score || null, category || null, source_platform || null, description || null]
     );
     res.json(result.rows[0]);
   } catch (err) {
     console.error('Error in /admin/trending:', err);
     res.status(500).json({ error: 'Could not add post.' });
+  }
+});
+
+// Admin only — adds a social media *profile* post (e.g. a suspected AI
+// influencer account) to the feed: a profile link, description, and an
+// admin-uploaded screenshot, instead of a video that gets frame-extracted.
+app.post('/admin/trending/profile', requireAdmin, uploadImage.single('screenshot'), async (req, res) => {
+  const { title, profile_url, description, ai_score, category, source_platform } = req.body;
+  if (!title || !profile_url) {
+    return res.status(400).json({ error: 'title and profile_url are required.' });
+  }
+  if (!req.file) {
+    return res.status(400).json({ error: 'A screenshot is required. Send it as form-data under the field name "screenshot".' });
+  }
+  try {
+    const result = await pool.query(
+      `INSERT INTO trending_posts (title, video_url, ai_score, category, source_platform, description, post_type, thumbnail_image)
+       VALUES ($1, $2, $3, $4, $5, $6, 'profile', $7)
+       RETURNING id, title, video_url, ai_score, category, source_platform, description, post_type, view_count, share_count, created_at`,
+      [title, profile_url, ai_score || null, category || null, source_platform || null, description || null, req.file.buffer]
+    );
+    res.json({ ...result.rows[0], thumbnail_url: `https://ai-screen-detector-backend.onrender.com/trending/${result.rows[0].id}/thumbnail` });
+  } catch (err) {
+    console.error('Error in /admin/trending/profile:', err);
+    res.status(500).json({ error: 'Could not add profile post.' });
   }
 });
 
@@ -873,13 +898,16 @@ app.get('/admin', requireAdminBasicAuth, (req, res) => {
   .post img { width: 60px; height: 60px; object-fit: cover; border-radius: 8px; background: #eee; }
   .post-info { flex: 1; font-size: 13px; }
   .delete-btn { background: #ff3b30; width: auto; padding: 6px 10px; font-size: 12px; }
-  #status { font-size: 13px; color: #666; margin-top: 6px; }
+  #status, #profileStatus { font-size: 13px; color: #666; margin-top: 6px; }
+  .type-tag { display: inline-block; font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; background: #eee; color: #666; margin-left: 6px; }
+  h2 { font-size: 16px; margin-top: 0; }
 </style>
 </head>
 <body>
 <h1>Trace Admin Dashboard</h1>
 
 <div class="card">
+  <h2>Add Video Post</h2>
   <label>Admin Password</label>
   <input id="secret" type="password" placeholder="Your admin secret">
 
@@ -906,7 +934,37 @@ app.get('/admin', requireAdminBasicAuth, (req, res) => {
 </div>
 
 <div class="card">
-  <h2 style="font-size:16px;">Existing Posts</h2>
+  <h2>Add Profile Post (AI influencer accounts, etc.)</h2>
+  <label>Profile Link</label>
+  <input id="profileUrl" type="text" placeholder="https://www.instagram.com/username or TikTok profile URL">
+
+  <label>Title / Handle</label>
+  <input id="profileTitle" type="text" placeholder="@username or account name">
+
+  <label>Description</label>
+  <textarea id="profileDescription" rows="3" placeholder="What makes this account notable — fully AI-generated, deepfake, etc."></textarea>
+
+  <label>Category</label>
+  <input id="profileCategory" type="text" placeholder="AI influencer, deepfake, brand...">
+  <label>Source Platform</label>
+  <select id="profilePlatform">
+    <option>TikTok</option>
+    <option>Instagram</option>
+    <option>Facebook</option>
+    <option>Twitter</option>
+  </select>
+  <label>AI Score (0.0 - 1.0)</label>
+  <input id="profileAiScore" type="text" placeholder="0.95">
+
+  <label>Screenshot of the profile</label>
+  <input id="profileScreenshot" type="file" accept="image/*">
+
+  <button onclick="createProfilePost()">Create Profile Post</button>
+  <div id="profileStatus"></div>
+</div>
+
+<div class="card">
+  <h2>Existing Posts</h2>
   <div id="postList"></div>
   <button onclick="loadPosts()" style="margin-top:10px;">Refresh List</button>
 </div>
@@ -960,6 +1018,39 @@ async function createPost() {
   loadPosts();
 }
 
+async function createProfilePost() {
+  const setProfileStatus = (msg) => document.getElementById('profileStatus').innerText = msg;
+  const fileInput = document.getElementById('profileScreenshot');
+  if (!fileInput.files[0]) return alert('Choose a screenshot image first');
+
+  setProfileStatus('Creating profile post...');
+  const form = new FormData();
+  form.append('title', document.getElementById('profileTitle').value);
+  form.append('profile_url', document.getElementById('profileUrl').value);
+  form.append('description', document.getElementById('profileDescription').value);
+  form.append('category', document.getElementById('profileCategory').value);
+  form.append('source_platform', document.getElementById('profilePlatform').value);
+  form.append('ai_score', parseFloat(document.getElementById('profileAiScore').value) || '');
+  form.append('screenshot', fileInput.files[0]);
+
+  const res = await fetch('/admin/trending/profile', {
+    method: 'POST',
+    headers: { 'x-admin-secret': secret() },
+    body: form
+  });
+  const data = await res.json();
+  if (data.error) return setProfileStatus('Error: ' + data.error);
+
+  setProfileStatus('Done! Profile post created.');
+  document.getElementById('profileTitle').value = '';
+  document.getElementById('profileUrl').value = '';
+  document.getElementById('profileDescription').value = '';
+  document.getElementById('profileCategory').value = '';
+  document.getElementById('profileAiScore').value = '';
+  fileInput.value = '';
+  loadPosts();
+}
+
 async function loadPosts() {
   const res = await fetch('/trending');
   const posts = await res.json();
@@ -968,8 +1059,9 @@ async function loadPosts() {
     <div class="post">
       <img src="\${p.thumbnail_url || ''}" onerror="this.style.display='none'">
       <div class="post-info">
-        <strong>\${p.title}</strong><br>
+        <strong>\${p.title}</strong><span class="type-tag">\${p.post_type || 'video'}</span><br>
         \${p.source_platform || ''} · \${p.category || ''} · \${Math.round((p.ai_score||0)*100)}% AI
+        \${p.description ? '<br>' + p.description : ''}
       </div>
       <button class="delete-btn" onclick="deletePost(\${p.id})">Delete</button>
     </div>
