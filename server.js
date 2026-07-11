@@ -98,30 +98,45 @@ async function analyzeVideoFrames(videoBuffer) {
 }
 
 // Sends text to a free, open-source AI-text-detector model hosted on
-// Hugging Face, and returns a 0-1 "probability this is AI-written" score.
-async function detectAIText(text, attempt = 1) {
+// Hugging Face. Tries a primary model first, and automatically falls
+// back to a second model if the first one is unavailable, instead of
+// failing outright.
+const TEXT_DETECTION_MODELS = [
+  'fakespot-ai/roberta-base-ai-text-detection-v1',
+  'openai-community/roberta-base-openai-detector',
+];
+
+async function detectAIText(text, modelIndex = 0, attempt = 1) {
+  if (modelIndex >= TEXT_DETECTION_MODELS.length) {
+    throw new Error('All text detection models are currently unavailable.');
+  }
+  const model = TEXT_DETECTION_MODELS[modelIndex];
+
   try {
-    const response = await fetch(
-      'https://api-inference.huggingface.co/models/fakespot-ai/roberta-base-ai-text-detection-v1',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${HUGGINGFACE_API_KEY}`,
-        },
-        body: JSON.stringify({ inputs: text }),
-      }
-    );
+    const response = await fetch(`https://api-inference.huggingface.co/models/${model}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${HUGGINGFACE_API_KEY}`,
+      },
+      body: JSON.stringify({ inputs: text }),
+    });
 
     const data = await response.json();
 
     if (data.error && data.estimated_time) {
       await new Promise((resolve) => setTimeout(resolve, Math.min(data.estimated_time * 1000, 15000)));
-      return detectAIText(text);
+      return detectAIText(text, modelIndex, attempt);
+    }
+
+    // If this model errored out for any other reason, try the next model.
+    if (data.error) {
+      console.error(`Text model ${model} failed:`, data.error);
+      return detectAIText(text, modelIndex + 1, 1);
     }
 
     const results = Array.isArray(data[0]) ? data[0] : data;
-    if (!Array.isArray(results)) return null;
+    if (!Array.isArray(results)) return detectAIText(text, modelIndex + 1, 1);
 
     const aiEntry = results.find((r) => /ai|generated|fake|machine/i.test(r.label));
     if (aiEntry) return aiEntry.score;
@@ -131,24 +146,23 @@ async function detectAIText(text, attempt = 1) {
 
     return results[0] ? results[0].score : null;
   } catch (err) {
-    // Occasional transient DNS/network hiccups from Render's side —
-    // retry once before giving up.
     if (attempt < 2) {
       await new Promise((resolve) => setTimeout(resolve, 2000));
-      return detectAIText(text, attempt + 1);
+      return detectAIText(text, modelIndex, attempt + 1);
     }
-    throw err;
+    // This model is fully down — move to the next one.
+    return detectAIText(text, modelIndex + 1, 1);
   }
 }
 
 function reasonForTextVerdict(verdict, confidence) {
   if (verdict === 'likely_ai') {
-    return `The writing style closely matches patterns common in AI-generated text (${Math.round(confidence * 100)}% match).`;
+    return `Traced as AI-written — the style closely matches patterns common in AI-generated text (${Math.round(confidence * 100)}% match).`;
   }
   if (verdict === 'likely_real') {
-    return `The writing style matches typical human writing patterns (${Math.round(confidence * 100)}% confidence).`;
+    return `Traced as human-written — the style matches typical human writing patterns (${Math.round(confidence * 100)}% confidence).`;
   }
-  return 'The writing style has mixed signals — not confident enough to call this either way.';
+  return "Signals were mixed — Trace isn't confident enough to call this either way.";
 }
 
 // Only requests that include the correct secret get through.
@@ -241,20 +255,20 @@ async function generateImageCaption(imageBuffer, attempt = 1) {
 function reasonForVerdict(verdict, flaggedBy) {
   if (verdict === 'likely_ai') {
     if (flaggedBy === 'ai_generated') {
-      return "Flagged mainly by our AI-generation detector — this closely matches patterns seen in fully AI-generated content.";
+      return "Traced as AI-generated — this closely matches patterns seen in fully AI-generated content.";
     }
     if (flaggedBy === 'deepfake') {
-      return "Flagged mainly by our face-swap detector — signs of facial manipulation were found.";
+      return "Traced as manipulated — signs of facial editing or a face-swap were found.";
     }
     if (flaggedBy === 'ai_music' || flaggedBy === 'ai_speech') {
-      return "Flagged by our AI-audio detector based on synthetic voice/audio patterns.";
+      return "Traced as AI-generated audio based on synthetic voice patterns.";
     }
-    return "Multiple signals pointed toward AI-generated content.";
+    return "Traced as AI-generated based on multiple signals.";
   }
   if (verdict === 'likely_real') {
-    return "No strong AI-generation or manipulation signals were detected.";
+    return "Traced as real — no strong AI-generation or manipulation signals were detected.";
   }
-  return "Signals were mixed — not confident enough to call this either way.";
+  return "Signals were mixed — Trace isn't confident enough to call this either way.";
 }
 
 function pickTopScore(entries) {
