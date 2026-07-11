@@ -44,6 +44,122 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const sharp = require('sharp');
+
+// ---------- SCAN CACHE (perceptual hashing) ----------
+//
+// Fingerprints every scanned image/video so a repeat scan of the same (or a
+// re-compressed/re-encoded copy of the same) media skips the paid Sightengine
+// call entirely. This is a "difference hash" (dHash): shrink to 9x8
+// grayscale pixels, and for each row record whether each pixel is brighter
+// than the one to its right. That gives a 64-bit fingerprint that's stable
+// across resizing/recompression, unlike a plain file hash (e.g. SHA256),
+// which changes if even one byte of the file changes.
+async function perceptualHash(imageBuffer) {
+  const { data } = await sharp(imageBuffer)
+    .resize(9, 8, { fit: 'fill' })
+    .grayscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  let bits = '';
+  for (let row = 0; row < 8; row++) {
+    for (let col = 0; col < 8; col++) {
+      const left = data[row * 9 + col];
+      const right = data[row * 9 + col + 1];
+      bits += left > right ? '1' : '0';
+    }
+  }
+
+  let hex = '';
+  for (let i = 0; i < bits.length; i += 4) {
+    hex += parseInt(bits.slice(i, i + 4), 2).toString(16);
+  }
+  return hex;
+}
+
+function hammingDistance(hexA, hexB) {
+  if (!hexA || !hexB || hexA.length !== hexB.length) return Infinity;
+  let distance = 0;
+  for (let i = 0; i < hexA.length; i++) {
+    let xor = parseInt(hexA[i], 16) ^ parseInt(hexB[i], 16);
+    while (xor) {
+      distance += xor & 1;
+      xor >>= 1;
+    }
+  }
+  return distance;
+}
+
+// Two 64-bit hashes differing by this many bits or fewer (~90% similar) are
+// treated as the same underlying media. Tight enough to avoid false
+// matches between genuinely different photos/videos.
+const HASH_MATCH_THRESHOLD = 6;
+
+// How many of the most recent cache rows to check for a fuzzy (non-exact)
+// match. An exact hash match is a fast indexed lookup regardless of table
+// size; fuzzy matching has no index to lean on, so it's bounded here to
+// keep it cheap. Fine at MVP scale — would need a proper nearest-neighbor
+// index (e.g. a BK-tree) to stay fast at a much larger scan volume.
+const FUZZY_MATCH_LOOKBACK = 2000;
+
+async function findCachedScan(hash, mediaType) {
+  const exact = await pool.query(
+    'SELECT * FROM scan_cache WHERE hash = $1 AND media_type = $2 ORDER BY created_at DESC LIMIT 1',
+    [hash, mediaType]
+  );
+  if (exact.rows.length > 0) return exact.rows[0];
+
+  const recent = await pool.query(
+    'SELECT * FROM scan_cache WHERE media_type = $1 ORDER BY created_at DESC LIMIT $2',
+    [mediaType, FUZZY_MATCH_LOOKBACK]
+  );
+  let best = null;
+  let bestDistance = HASH_MATCH_THRESHOLD + 1;
+  for (const row of recent.rows) {
+    const distance = hammingDistance(hash, row.hash);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = row;
+    }
+  }
+  return bestDistance <= HASH_MATCH_THRESHOLD ? best : null;
+}
+
+async function saveScanToCache({ hash, mediaType, verdict, confidence, reason, caption, aiScore, deepfakeScore, flaggedBy, provider }) {
+  try {
+    await pool.query(
+      `INSERT INTO scan_cache (hash, media_type, verdict, confidence, reason, caption, ai_score, deepfake_score, flagged_by, provider)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [hash, mediaType, verdict, confidence, reason || null, caption || null, aiScore ?? null, deepfakeScore ?? null, flaggedBy || null, provider]
+    );
+  } catch (err) {
+    // Caching is a cost optimization, not core functionality — never let a
+    // cache write failure break the scan response the user is waiting on.
+    console.error('Failed to save scan to cache:', err.message);
+  }
+}
+
+async function recordCacheHit(id) {
+  try {
+    await pool.query('UPDATE scan_cache SET hit_count = hit_count + 1, last_hit_at = now() WHERE id = $1', [id]);
+  } catch (err) {
+    console.error('Failed to record cache hit:', err.message);
+  }
+}
+
+function cachedScanResponse(row, extra) {
+  return {
+    verdict: row.verdict,
+    confidence: row.confidence,
+    caption: row.caption,
+    reason: row.reason,
+    flagged_by: row.flagged_by,
+    scores: { ai_generated: row.ai_score, deepfake: row.deepfake_score },
+    source: 'cache',
+    ...extra,
+  };
+}
 
 // All visual content (video uploads AND links) goes through Sightengine's
 // IMAGE detector, not their video detector — this keeps everything on
@@ -51,79 +167,88 @@ const path = require('path');
 // We pull up to 5 still frames out of the video ourselves using ffmpeg
 // (a free tool), then run each frame through the same image detector
 // used by Photo scan, taking the highest score seen across frames.
-async function analyzeVideoFrames(videoBuffer) {
+// Phase 1: pull frames out with ffmpeg (local, free) and hash the first one.
+// Callers check the scan cache with this hash BEFORE phase 2 spends
+// anything on Sightengine/captioning — so a repeat scan of the same video
+// never even touches the paid API. Caller owns cleanup of the returned
+// tempDir (always in a try/finally).
+async function extractVideoFrames(videoBuffer) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frames-'));
   const videoPath = path.join(tempDir, 'input.mp4');
   fs.writeFileSync(videoPath, videoBuffer);
   const framePattern = path.join(tempDir, 'frame-%02d.jpg');
 
-  try {
-    await new Promise((resolve, reject) => {
-      execFile(
-        ffmpegPath,
-        ['-i', videoPath, '-vf', 'fps=1/2,scale=480:-1', '-vframes', '5', framePattern],
-        (err) => (err ? reject(err) : resolve())
-      );
-    });
+  await new Promise((resolve, reject) => {
+    execFile(
+      ffmpegPath,
+      ['-i', videoPath, '-vf', 'fps=1/2,scale=480:-1', '-vframes', '5', framePattern],
+      (err) => (err ? reject(err) : resolve())
+    );
+  });
 
-    const frameFiles = fs.readdirSync(tempDir).filter((f) => f.startsWith('frame-'));
-    let aiScore = null;
-    let deepfakeScore = null;
+  const frameFiles = fs.readdirSync(tempDir).filter((f) => f.startsWith('frame-'));
 
-    // Grab the first frame as a reusable thumbnail (base64) so callers
-    // like Link scan can save it to history without a second download —
-    // and also caption it, same as Photo scan, so video results can say
-    // what's actually in the clip instead of just a verdict.
-    let thumbnailBase64 = null;
-    let firstFrameBuffer = null;
-    if (frameFiles.length > 0) {
-      firstFrameBuffer = fs.readFileSync(path.join(tempDir, frameFiles[0]));
-      thumbnailBase64 = firstFrameBuffer.toString('base64');
-    }
-
-    // Check all frames at the same time instead of one after another —
-    // this is the main thing that was making video scans slow. Captioning
-    // the first frame happens alongside it, not after, so it doesn't add
-    // extra wait time.
-    const [frameResults, caption] = await Promise.all([
-      Promise.all(
-        frameFiles.map(async (frameFile) => {
-          const frameBuffer = fs.readFileSync(path.join(tempDir, frameFile));
-          const form = new FormData();
-          form.append('media', frameBuffer, { filename: frameFile });
-          form.append('models', 'genai,deepfake');
-          form.append('api_user', SIGHTENGINE_API_USER);
-          form.append('api_secret', SIGHTENGINE_API_SECRET);
-
-          const response = await fetch('https://api.sightengine.com/1.0/check.json', {
-            method: 'POST',
-            body: form,
-          });
-          const data = await response.json();
-
-          if (data.status !== 'success') {
-            console.error('Sightengine rejected a frame:', data);
-            return { ai: null, deepfake: null };
-          }
-
-          return {
-            ai: data.type && typeof data.type.ai_generated === 'number' ? data.type.ai_generated : null,
-            deepfake: data.deepfake && typeof data.deepfake.score === 'number' ? data.deepfake.score : null,
-          };
-        })
-      ),
-      firstFrameBuffer ? generateImageCaption(firstFrameBuffer) : Promise.resolve(null),
-    ]);
-
-    for (const result of frameResults) {
-      if (result.ai !== null && (aiScore === null || result.ai > aiScore)) aiScore = result.ai;
-      if (result.deepfake !== null && (deepfakeScore === null || result.deepfake > deepfakeScore)) deepfakeScore = result.deepfake;
-    }
-
-    return { aiScore, deepfakeScore, frameCount: frameFiles.length, thumbnailBase64, caption };
-  } finally {
-    fs.rmSync(tempDir, { recursive: true, force: true });
+  // Grab the first frame as a reusable thumbnail (base64) so callers like
+  // Link scan can save it to history without a second download, and as the
+  // source for the perceptual hash and (on a cache miss) the caption.
+  let thumbnailBase64 = null;
+  let firstFrameBuffer = null;
+  let hash = null;
+  if (frameFiles.length > 0) {
+    firstFrameBuffer = fs.readFileSync(path.join(tempDir, frameFiles[0]));
+    thumbnailBase64 = firstFrameBuffer.toString('base64');
+    hash = await perceptualHash(firstFrameBuffer);
   }
+
+  return { tempDir, frameFiles, firstFrameBuffer, thumbnailBase64, hash };
+}
+
+// Phase 2: the expensive part (paid Sightengine calls + captioning). Only
+// run this on a cache miss.
+async function scoreVideoFrames(tempDir, frameFiles, firstFrameBuffer) {
+  let aiScore = null;
+  let deepfakeScore = null;
+
+  // Check all frames at the same time instead of one after another — this
+  // is the main thing that was making video scans slow. Captioning the
+  // first frame happens alongside it, not after, so it doesn't add extra
+  // wait time.
+  const [frameResults, caption] = await Promise.all([
+    Promise.all(
+      frameFiles.map(async (frameFile) => {
+        const frameBuffer = fs.readFileSync(path.join(tempDir, frameFile));
+        const form = new FormData();
+        form.append('media', frameBuffer, { filename: frameFile });
+        form.append('models', 'genai,deepfake');
+        form.append('api_user', SIGHTENGINE_API_USER);
+        form.append('api_secret', SIGHTENGINE_API_SECRET);
+
+        const response = await fetch('https://api.sightengine.com/1.0/check.json', {
+          method: 'POST',
+          body: form,
+        });
+        const data = await response.json();
+
+        if (data.status !== 'success') {
+          console.error('Sightengine rejected a frame:', data);
+          return { ai: null, deepfake: null };
+        }
+
+        return {
+          ai: data.type && typeof data.type.ai_generated === 'number' ? data.type.ai_generated : null,
+          deepfake: data.deepfake && typeof data.deepfake.score === 'number' ? data.deepfake.score : null,
+        };
+      })
+    ),
+    firstFrameBuffer ? generateImageCaption(firstFrameBuffer) : Promise.resolve(null),
+  ]);
+
+  for (const result of frameResults) {
+    if (result.ai !== null && (aiScore === null || result.ai > aiScore)) aiScore = result.ai;
+    if (result.deepfake !== null && (deepfakeScore === null || result.deepfake > deepfakeScore)) deepfakeScore = result.deepfake;
+  }
+
+  return { aiScore, deepfakeScore, caption };
 }
 
 // Sends text to a free, open-source AI-text-detector model hosted on
@@ -191,7 +316,7 @@ function reasonForTextVerdict(verdict, confidence) {
   if (verdict === 'likely_real') {
     return `Traced as human-written. The style matches typical human writing patterns (${Math.round(confidence * 100)}% confidence).`;
   }
-  return "Signals were mixed — Trace isn't confident enough to call this either way.";
+  return "Signals were mixed. Trace isn't confident enough to call this either way.";
 }
 
 // Only requests that include the correct secret get through.
@@ -314,24 +439,24 @@ function reasonForVerdict(verdict, flaggedBy, caption) {
     if (flaggedBy === 'ai_generated') {
       return withSubject(
         caption,
-        "Traced as AI-generated — flagged strongly by our AI-generation detector, the kind of match these models make when they pick up on unnatural skin or hair texture, inconsistent lighting and shadows, warped background detail, or irregular hands and fine detail that generators still struggle to get right."
+        "Traced as AI-generated. Flagged strongly by our AI-generation detector, the kind of match these models make when they pick up on unnatural skin or hair texture, inconsistent lighting and shadows, warped background detail, or irregular hands and fine detail that generators still struggle to get right."
       );
     }
     if (flaggedBy === 'deepfake') {
       return withSubject(
         caption,
-        "Traced as manipulated — signs of facial editing or a face-swap were found, the kind of thing that usually shows up as a mismatched skin tone at the edge of the face, unnatural blinking or mouth movement, or soft blurring where the swapped face meets the original footage."
+        "Traced as manipulated. Signs of facial editing or a face-swap were found, the kind of thing that usually shows up as a mismatched skin tone at the edge of the face, unnatural blinking or mouth movement, or soft blurring where the swapped face meets the original footage."
       );
     }
     if (flaggedBy === 'ai_music' || flaggedBy === 'ai_speech') {
-      return "Traced as AI-generated audio based on synthetic voice patterns — a flatter pitch range and unnaturally even pacing than real speech typically has.";
+      return "Traced as AI-generated audio based on synthetic voice patterns, with a flatter pitch range and unnaturally even pacing than real speech typically has.";
     }
     return withSubject(caption, "Traced as AI-generated based on multiple signals.");
   }
   if (verdict === 'likely_real') {
-    return withSubject(caption, "Traced as real — no strong AI-generation or manipulation signals were detected.");
+    return withSubject(caption, "Traced as real. No strong AI-generation or manipulation signals were detected.");
   }
-  return "Signals were mixed — Trace isn't confident enough to call this either way.";
+  return "Signals were mixed. Trace isn't confident enough to call this either way.";
 }
 
 function pickTopScore(entries) {
@@ -350,6 +475,15 @@ app.post('/analyze', scanLimiter, uploadImage.single('image'), async (req, res) 
     }
     if (!SIGHTENGINE_API_USER || !SIGHTENGINE_API_SECRET) {
       return res.status(500).json({ error: 'Server is missing its detection service credentials.' });
+    }
+
+    // Fingerprint before spending anything on Sightengine/captioning — a
+    // repeat (or re-compressed) scan of the same photo returns instantly.
+    const hash = await perceptualHash(req.file.buffer);
+    const cached = await findCachedScan(hash, 'image');
+    if (cached) {
+      recordCacheHit(cached.id);
+      return res.json(cachedScanResponse(cached, { media_type: 'image' }));
     }
 
     const form = new FormData();
@@ -379,12 +513,26 @@ app.post('/analyze', scanLimiter, uploadImage.single('image'), async (req, res) 
     ]);
 
     const { verdict, confidence } = scoreToVerdict(top ? top.value : null);
+    const reason = reasonForVerdict(verdict, top ? top.label : null, caption);
+
+    saveScanToCache({
+      hash,
+      mediaType: 'image',
+      verdict,
+      confidence,
+      reason,
+      caption,
+      aiScore,
+      deepfakeScore,
+      flaggedBy: top ? top.label : null,
+      provider: 'sightengine',
+    });
 
     res.json({
       verdict,
       confidence,
       caption,
-      reason: reasonForVerdict(verdict, top ? top.label : null, caption),
+      reason,
       flagged_by: top ? top.label : null,
       scores: { ai_generated: aiScore, deepfake: deepfakeScore },
       media_type: 'image',
@@ -408,25 +556,54 @@ app.post('/analyze-video', scanLimiter, uploadMedia.single('video'), async (req,
       return res.status(500).json({ error: 'Server is missing its detection service credentials.' });
     }
 
-    const { aiScore, deepfakeScore, caption } = await analyzeVideoFrames(req.file.buffer);
+    const { tempDir, frameFiles, firstFrameBuffer, hash } = await extractVideoFrames(req.file.buffer);
+    try {
+      if (hash) {
+        const cached = await findCachedScan(hash, 'video');
+        if (cached) {
+          recordCacheHit(cached.id);
+          return res.json(cachedScanResponse(cached, { media_type: 'video' }));
+        }
+      }
 
-    const top = pickTopScore([
-      { label: 'ai_generated', value: aiScore },
-      { label: 'deepfake', value: deepfakeScore },
-    ]);
+      const { aiScore, deepfakeScore, caption } = await scoreVideoFrames(tempDir, frameFiles, firstFrameBuffer);
 
-    const { verdict, confidence } = scoreToVerdict(top ? top.value : null);
+      const top = pickTopScore([
+        { label: 'ai_generated', value: aiScore },
+        { label: 'deepfake', value: deepfakeScore },
+      ]);
 
-    res.json({
-      verdict,
-      confidence,
-      caption,
-      reason: reasonForVerdict(verdict, top ? top.label : null, caption),
-      flagged_by: top ? top.label : null,
-      scores: { ai_generated: aiScore, deepfake: deepfakeScore },
-      media_type: 'video',
-      source: 'internal',
-    });
+      const { verdict, confidence } = scoreToVerdict(top ? top.value : null);
+      const reason = reasonForVerdict(verdict, top ? top.label : null, caption);
+
+      if (hash) {
+        saveScanToCache({
+          hash,
+          mediaType: 'video',
+          verdict,
+          confidence,
+          reason,
+          caption,
+          aiScore,
+          deepfakeScore,
+          flaggedBy: top ? top.label : null,
+          provider: 'sightengine',
+        });
+      }
+
+      res.json({
+        verdict,
+        confidence,
+        caption,
+        reason,
+        flagged_by: top ? top.label : null,
+        scores: { ai_generated: aiScore, deepfake: deepfakeScore },
+        media_type: 'video',
+        source: 'internal',
+      });
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
   } catch (err) {
     console.error('Error in /analyze-video:', err);
     res.status(500).json({ error: "Oops! Trace couldn't finish that scan. Please try again." });
@@ -676,25 +853,58 @@ app.post('/analyze-link', scanLimiter, async (req, res) => {
       const videoBuffer = fs.readFileSync(tempPath);
       fs.unlink(tempPath, () => {}); // clean up the temp file either way
 
-      const { aiScore, deepfakeScore, thumbnailBase64, caption } = await analyzeVideoFrames(videoBuffer);
+      const { tempDir, frameFiles, firstFrameBuffer, thumbnailBase64, hash } = await extractVideoFrames(videoBuffer);
+      try {
+        if (hash) {
+          const cached = await findCachedScan(hash, 'video');
+          if (cached) {
+            recordCacheHit(cached.id);
+            return res.json(cachedScanResponse(cached, {
+              media_type: 'video',
+              from_link: true,
+              thumbnail_base64: thumbnailBase64,
+            }));
+          }
+        }
 
-      const top = pickTopScore([
-        { label: 'ai_generated', value: aiScore },
-        { label: 'deepfake', value: deepfakeScore },
-      ]);
-      const { verdict, confidence } = scoreToVerdict(top ? top.value : null);
+        const { aiScore, deepfakeScore, caption } = await scoreVideoFrames(tempDir, frameFiles, firstFrameBuffer);
 
-      res.json({
-        verdict,
-        confidence,
-        caption,
-        reason: reasonForVerdict(verdict, top ? top.label : null, caption),
-        flagged_by: top ? top.label : null,
-        media_type: 'video',
-        source: 'internal',
-        from_link: true,
-        thumbnail_base64: thumbnailBase64,
-      });
+        const top = pickTopScore([
+          { label: 'ai_generated', value: aiScore },
+          { label: 'deepfake', value: deepfakeScore },
+        ]);
+        const { verdict, confidence } = scoreToVerdict(top ? top.value : null);
+        const reason = reasonForVerdict(verdict, top ? top.label : null, caption);
+
+        if (hash) {
+          saveScanToCache({
+            hash,
+            mediaType: 'video',
+            verdict,
+            confidence,
+            reason,
+            caption,
+            aiScore,
+            deepfakeScore,
+            flaggedBy: top ? top.label : null,
+            provider: 'sightengine',
+          });
+        }
+
+        res.json({
+          verdict,
+          confidence,
+          caption,
+          reason,
+          flagged_by: top ? top.label : null,
+          media_type: 'video',
+          source: 'internal',
+          from_link: true,
+          thumbnail_base64: thumbnailBase64,
+        });
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
     } catch (processErr) {
       console.error('Error processing downloaded video:', processErr);
       fs.unlink(tempPath, () => {});
@@ -980,7 +1190,7 @@ app.get('/admin', requireAdminBasicAuth, (req, res) => {
   <input id="profileTitle" type="text" placeholder="@username or account name">
 
   <label>Description</label>
-  <textarea id="profileDescription" rows="3" placeholder="What makes this account notable — fully AI-generated, deepfake, etc."></textarea>
+  <textarea id="profileDescription" rows="3" placeholder="What makes this account notable: fully AI-generated, deepfake, etc."></textarea>
 
   <label>Category</label>
   <input id="profileCategory" type="text" placeholder="AI influencer, deepfake, brand...">
@@ -1009,7 +1219,7 @@ app.get('/admin', requireAdminBasicAuth, (req, res) => {
 
   <div id="cropPreviewWrap">
     <img id="cropPreview">
-    <span style="font-size:13px;color:#666;">Cropped — this is what will upload.</span>
+    <span style="font-size:13px;color:#666;">Cropped. This is what will upload.</span>
   </div>
 
   <button onclick="createProfilePost()">Create Profile Post</button>
