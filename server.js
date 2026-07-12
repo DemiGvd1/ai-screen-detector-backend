@@ -11,7 +11,9 @@ const rateLimit = require('express-rate-limit');
 const { pool, initDB } = require('./db');
 
 const app = express();
-app.use(express.json());
+// Default is 100kb — too small once /submit-trending started accepting a
+// base64-encoded thumbnail image in the JSON body instead of multipart.
+app.use(express.json({ limit: '10mb' }));
 
 initDB().catch((err) => console.error('Database setup failed:', err));
 
@@ -971,14 +973,55 @@ app.get('/analyze-link/preview', publicLimiter, async (req, res) => {
   }
 });
 
+// ---------- FEEDBACK LOOP ----------
+
+// Public, anonymous — "We're not sure either, what's your gut call?" This
+// is exactly where the automated detector has the least confidence, so a
+// human guess here is the most valuable signal Trace collects. Not shown
+// anywhere; purely for later analysis (e.g. recalibrating the uncertain
+// threshold over time).
+app.post('/feedback/uncertain', publicLimiter, async (req, res) => {
+  const { media_type, confidence, user_guess } = req.body;
+  if (!media_type || !user_guess) {
+    return res.status(400).json({ error: 'Provide "media_type" and "user_guess".' });
+  }
+  if (user_guess !== 'real' && user_guess !== 'ai') {
+    return res.status(400).json({ error: '"user_guess" must be "real" or "ai".' });
+  }
+  try {
+    await pool.query(
+      'INSERT INTO uncertain_feedback (media_type, confidence, user_guess) VALUES ($1, $2, $3)',
+      [media_type, typeof confidence === 'number' ? confidence : null, user_guess]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error in /feedback/uncertain:', err);
+    res.status(500).json({ error: 'Could not record feedback.' });
+  }
+});
+
 // ---------- TRENDING FEED ----------
 
 // Public — the app calls this to load the scrollable feed.
 app.get('/trending', publicLimiter, async (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT id, title, video_url, thumbnail_url, ai_score, category, source_platform, post_type, description, view_count, share_count, created_at, (thumbnail_image IS NOT NULL) AS has_generated_thumbnail FROM trending_posts ORDER BY created_at DESC LIMIT 50'
-    );
+    const result = await pool.query(`
+      SELECT
+        tp.id, tp.title, tp.video_url, tp.thumbnail_url, tp.ai_score, tp.category,
+        tp.source_platform, tp.post_type, tp.description, tp.view_count, tp.share_count,
+        tp.created_at, (tp.thumbnail_image IS NOT NULL) AS has_generated_thumbnail,
+        COALESCE(v.agree_count, 0) AS agree_count,
+        COALESCE(v.disagree_count, 0) AS disagree_count
+      FROM trending_posts tp
+      LEFT JOIN (
+        SELECT post_id,
+          COUNT(*) FILTER (WHERE vote = 'agree')::int AS agree_count,
+          COUNT(*) FILTER (WHERE vote = 'disagree')::int AS disagree_count
+        FROM trending_votes
+        GROUP BY post_id
+      ) v ON v.post_id = tp.id
+      ORDER BY tp.created_at DESC LIMIT 50
+    `);
     const posts = result.rows.map((row) => {
       const post = { ...row };
       if (row.has_generated_thumbnail) {
@@ -991,6 +1034,47 @@ app.get('/trending', publicLimiter, async (req, res) => {
   } catch (err) {
     console.error('Error in /trending:', err);
     res.status(500).json({ error: 'Could not load trending posts.' });
+  }
+});
+
+// Public — one vote per device per post. Re-voting (even a different
+// choice) updates the existing row instead of adding a new one.
+app.post('/trending/:id/vote', publicLimiter, async (req, res) => {
+  const { device_id, vote } = req.body;
+  if (!device_id || !vote) {
+    return res.status(400).json({ error: 'Provide "device_id" and "vote".' });
+  }
+  if (vote !== 'agree' && vote !== 'disagree') {
+    return res.status(400).json({ error: '"vote" must be "agree" or "disagree".' });
+  }
+  try {
+    const postCheck = await pool.query('SELECT id FROM trending_posts WHERE id = $1', [req.params.id]);
+    if (postCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Post not found.' });
+    }
+
+    await pool.query(
+      `INSERT INTO trending_votes (post_id, device_id, vote)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (post_id, device_id) DO UPDATE SET vote = EXCLUDED.vote`,
+      [req.params.id, device_id, vote]
+    );
+
+    const counts = await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE vote = 'agree')::int AS agree_count,
+         COUNT(*) FILTER (WHERE vote = 'disagree')::int AS disagree_count
+       FROM trending_votes WHERE post_id = $1`,
+      [req.params.id]
+    );
+
+    res.json({
+      agree_count: counts.rows[0].agree_count,
+      disagree_count: counts.rows[0].disagree_count,
+    });
+  } catch (err) {
+    console.error('Error in /trending/:id/vote:', err);
+    res.status(500).json({ error: 'Could not record vote.' });
   }
 });
 
@@ -1138,6 +1222,119 @@ app.delete('/admin/trending/:id', requireAdmin, async (req, res) => {
   }
 });
 
+// ---------- ADD TO TRENDING (anonymous submission + moderation) ----------
+
+// Public, anonymous — "Think others should see this? Add to Trending."
+// Shown after a likely_ai scan (Photo/Video/Link). Never goes live directly
+// — always lands as a pending row an admin has to approve first, so an
+// anonymous submission can never post to Trending unreviewed. Carries the
+// media itself (thumbnail_base64) for Photo/Video, or the original link
+// (video_url) for Link scans — nothing that identifies who submitted it.
+app.post('/submit-trending', scanLimiter, async (req, res) => {
+  const { media_type, video_url, thumbnail_base64, category_tag, verdict, confidence, reason } = req.body;
+  if (!media_type) {
+    return res.status(400).json({ error: 'Provide "media_type".' });
+  }
+  if (!video_url && !thumbnail_base64) {
+    return res.status(400).json({ error: 'Provide "video_url" (Link scan) or "thumbnail_base64" (Photo/Video scan).' });
+  }
+  try {
+    const thumbnailBuffer = thumbnail_base64 ? Buffer.from(thumbnail_base64, 'base64') : null;
+    await pool.query(
+      `INSERT INTO trending_submissions (media_type, video_url, thumbnail_image, category_tag, verdict, confidence, reason, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')`,
+      [
+        media_type,
+        video_url || null,
+        thumbnailBuffer,
+        category_tag || null,
+        verdict || null,
+        typeof confidence === 'number' ? confidence : null,
+        reason || null,
+      ]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error in /submit-trending:', err);
+    res.status(500).json({ error: 'Could not submit.' });
+  }
+});
+
+// Admin only — lists submissions awaiting review, oldest first.
+app.get('/admin/trending-submissions', requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, media_type, video_url, category_tag, verdict, confidence, reason, status, created_at,
+              (thumbnail_image IS NOT NULL) AS has_thumbnail
+       FROM trending_submissions WHERE status = 'pending' ORDER BY created_at ASC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error in /admin/trending-submissions:', err);
+    res.status(500).json({ error: 'Could not load submissions.' });
+  }
+});
+
+// Admin-gated via Basic Auth (not the x-admin-secret header) because this
+// is loaded by a plain <img src>, same reasoning as /admin itself — a
+// browser attaches its cached Basic Auth automatically to same-origin
+// image requests, but can't attach a custom header to one.
+app.get('/admin/trending-submissions/:id/thumbnail', requireAdminBasicAuth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT thumbnail_image FROM trending_submissions WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0 || !result.rows[0].thumbnail_image) {
+      return res.status(404).send('No thumbnail available.');
+    }
+    res.set('Content-Type', 'image/jpeg');
+    res.send(result.rows[0].thumbnail_image);
+  } catch (err) {
+    console.error('Error in /admin/trending-submissions/:id/thumbnail:', err);
+    res.status(500).send('Could not load thumbnail.');
+  }
+});
+
+// Admin only — copies a pending submission into the real trending_posts
+// table and removes it from the queue. video_url may be null (Photo/Video
+// submissions have no external link) — trending_posts allows that.
+app.post('/admin/trending-submissions/:id/approve', requireAdmin, async (req, res) => {
+  try {
+    const submissionResult = await pool.query('SELECT * FROM trending_submissions WHERE id = $1', [req.params.id]);
+    if (submissionResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Submission not found.' });
+    }
+    const s = submissionResult.rows[0];
+    const title = s.category_tag || 'Reported AI content';
+
+    const inserted = await pool.query(
+      `INSERT INTO trending_posts (title, video_url, thumbnail_image, ai_score, category, description, post_type)
+       VALUES ($1, $2, $3, $4, $5, $6, 'video')
+       RETURNING id`,
+      [title, s.video_url, s.thumbnail_image, s.confidence, s.category_tag, s.reason]
+    );
+
+    await pool.query('DELETE FROM trending_submissions WHERE id = $1', [req.params.id]);
+
+    res.json({ success: true, id: inserted.rows[0].id });
+  } catch (err) {
+    console.error('Error approving submission:', err);
+    res.status(500).json({ error: 'Could not approve submission.' });
+  }
+});
+
+// Admin only — discards a pending submission.
+app.post('/admin/trending-submissions/:id/reject', requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM trending_submissions WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Submission not found.' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error rejecting submission:', err);
+    res.status(500).json({ error: 'Could not reject submission.' });
+  }
+});
+
 // Admin only — given a TikTok link, fetches its official thumbnail
 // and title using TikTok's public oEmbed feature (the same thing
 // used for legitimate link previews, not a workaround).
@@ -1200,6 +1397,12 @@ app.get('/admin', requireAdminBasicAuth, (req, res) => {
   #status, #profileStatus { font-size: 13px; color: #666; margin-top: 6px; }
   .type-tag { display: inline-block; font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; background: #eee; color: #666; margin-left: 6px; }
   h2 { font-size: 16px; margin-top: 0; }
+  .submission { display: flex; gap: 10px; align-items: flex-start; border-bottom: 1px solid #eee; padding: 10px 0; }
+  .submission img { width: 70px; height: 70px; object-fit: cover; border-radius: 8px; background: #eee; flex-shrink: 0; }
+  .submission-info { flex: 1; font-size: 13px; }
+  .submission-actions { display: flex; gap: 6px; flex-shrink: 0; }
+  .approve-btn { background: #34c759; width: auto; padding: 6px 10px; font-size: 12px; }
+  .reject-btn { background: #ff3b30; width: auto; padding: 6px 10px; font-size: 12px; }
   #cropperContainer { display: none; margin-top: 10px; }
   #cropperImageWrap { max-height: 65vh; overflow: hidden; background: #000; border-radius: 8px; }
   #cropperImage { display: block; max-width: 100%; }
@@ -1282,6 +1485,12 @@ app.get('/admin', requireAdminBasicAuth, (req, res) => {
 
   <button onclick="createProfilePost()">Create Profile Post</button>
   <div id="profileStatus"></div>
+</div>
+
+<div class="card">
+  <h2>Pending Submissions</h2>
+  <div id="submissionList" style="font-size:13px;color:#666;">Loading...</div>
+  <button onclick="loadSubmissions()" style="margin-top:10px;">Refresh List</button>
 </div>
 
 <div class="card">
@@ -1442,7 +1651,58 @@ async function deletePost(id) {
   loadPosts();
 }
 
+async function loadSubmissions() {
+  const list = document.getElementById('submissionList');
+  const res = await fetch('/admin/trending-submissions', {
+    headers: { 'x-admin-secret': secret() }
+  });
+  const submissions = await res.json();
+  if (submissions.error) {
+    list.innerHTML = submissions.error;
+    return;
+  }
+  if (submissions.length === 0) {
+    list.innerHTML = 'Nothing pending.';
+    return;
+  }
+  list.innerHTML = submissions.map(s => \`
+    <div class="submission">
+      \${s.has_thumbnail ? \`<img src="/admin/trending-submissions/\${s.id}/thumbnail" onerror="this.style.display='none'">\` : ''}
+      <div class="submission-info">
+        <span class="type-tag">\${s.media_type}</span>
+        \${s.category_tag ? '<span class="type-tag">' + s.category_tag + '</span>' : ''}<br>
+        \${Math.round((s.confidence||0)*100)}% \${s.verdict || ''}<br>
+        \${s.reason ? s.reason.slice(0, 140) : ''}
+        \${s.video_url ? '<br><a href="' + s.video_url + '" target="_blank">' + s.video_url + '</a>' : ''}
+      </div>
+      <div class="submission-actions">
+        <button class="approve-btn" onclick="approveSubmission(\${s.id})">Approve</button>
+        <button class="reject-btn" onclick="rejectSubmission(\${s.id})">Reject</button>
+      </div>
+    </div>
+  \`).join('');
+}
+
+async function approveSubmission(id) {
+  await fetch('/admin/trending-submissions/' + id + '/approve', {
+    method: 'POST',
+    headers: { 'x-admin-secret': secret() }
+  });
+  loadSubmissions();
+  loadPosts();
+}
+
+async function rejectSubmission(id) {
+  if (!confirm('Reject this submission?')) return;
+  await fetch('/admin/trending-submissions/' + id + '/reject', {
+    method: 'POST',
+    headers: { 'x-admin-secret': secret() }
+  });
+  loadSubmissions();
+}
+
 loadPosts();
+loadSubmissions();
 </script>
 </body>
 </html>`);
