@@ -913,6 +913,64 @@ app.post('/analyze-link', scanLimiter, async (req, res) => {
   });
 });
 
+// Public — lets the app show a quick preview (thumbnail/title) of a
+// pasted link before running the full scan, so people can see what
+// they're about to analyze. No download, no Sightengine call — just
+// TikTok's public oEmbed feature, so it's fast and free either way.
+// Only TikTok exposes a no-auth preview API like this; Instagram/
+// Facebook/Twitter all require a developer access token for their
+// oEmbed equivalents, so those platforms just report no preview
+// available and the app skips straight to the "Analyze" button.
+app.get('/analyze-link/preview', publicLimiter, async (req, res) => {
+  const rawUrl = req.query.url;
+  if (!rawUrl) {
+    return res.status(400).json({ error: 'Provide a "url" to preview.' });
+  }
+  if (!isAllowedSocialLink(rawUrl)) {
+    return res.status(400).json({
+      error: 'Please paste a link from TikTok, Instagram, Facebook, or Twitter/X.',
+    });
+  }
+
+  const resolvedUrl = await resolveLinkForDownload(rawUrl);
+  if (!resolvedUrl) {
+    return res.status(400).json({
+      error: 'That link redirects somewhere Trace doesn\'t recognize as a supported platform.',
+    });
+  }
+
+  let hostname;
+  try {
+    hostname = new URL(resolvedUrl).hostname.toLowerCase();
+  } catch {
+    return res.json({ preview_available: false, resolved_url: resolvedUrl });
+  }
+  const isTikTok = hostname === 'tiktok.com' || hostname.endsWith('.tiktok.com');
+
+  if (!isTikTok) {
+    return res.json({ preview_available: false, resolved_url: resolvedUrl });
+  }
+
+  try {
+    const oembedUrl = `https://www.tiktok.com/oembed?url=${encodeURIComponent(resolvedUrl)}`;
+    const response = await fetch(oembedUrl);
+    if (!response.ok) {
+      return res.json({ preview_available: false, resolved_url: resolvedUrl });
+    }
+    const data = await response.json();
+    res.json({
+      preview_available: true,
+      title: data.title || null,
+      thumbnail_url: data.thumbnail_url || null,
+      author_name: data.author_name || null,
+      resolved_url: resolvedUrl,
+    });
+  } catch (err) {
+    console.error('Error in /analyze-link/preview:', err);
+    res.json({ preview_available: false, resolved_url: resolvedUrl });
+  }
+});
+
 // ---------- TRENDING FEED ----------
 
 // Public — the app calls this to load the scrollable feed.
