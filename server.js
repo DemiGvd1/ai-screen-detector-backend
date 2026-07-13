@@ -613,49 +613,71 @@ app.post('/analyze-video', scanLimiter, uploadMedia.single('video'), async (req,
 });
 
 // ---------- AUDIO ----------
-const AUDIO_DETECTION_MODELS = [
-  'MelodyMachine/Deepfake-audio-detection-V2',
-  'mo-thecreator/Deepfake-audio-detection',
-];
+//
+// Hugging Face retired free serverless hosting for the audio-classification
+// task entirely — every audio-classification model checked (including the
+// two this used to call) now has zero active inference providers, so the
+// old HF Inference API call always failed and silently returned "uncertain".
+// This calls a self-contained Gradio Space instead (the model runs inside
+// the Space itself, not proxied through HF's Inference API, so it isn't
+// affected by that deprecation). It's a free community demo, not an
+// official API: no uptime guarantee, and a cold Space can take 30-60s to
+// wake up on its first request after being idle.
+const AUDIO_SPACE_HOST = 'https://davidcombei-audio-deepfake-detection.hf.space';
 
-async function detectAIAudio(audioBuffer, modelIndex = 0, attempt = 1) {
-  if (modelIndex >= AUDIO_DETECTION_MODELS.length) {
-    return null;
-  }
-  const model = AUDIO_DETECTION_MODELS[modelIndex];
+async function detectAIAudio(audioBuffer, filename = 'audio.wav') {
+  // Uses Node's built-in fetch/FormData/Blob (global.*), not the node-fetch
+  // v2 / 'form-data' package imports this file uses everywhere else — those
+  // are the older Node-stream-based APIs and can't be sent as a native
+  // fetch body (mixing them throws "source.on is not a function").
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 85000);
   try {
-    const response = await fetch(`https://router.huggingface.co/hf-inference/models/${model}`, {
+    const form = new global.FormData();
+    form.append('files', new global.Blob([audioBuffer]), filename);
+    const uploadResponse = await global.fetch(`${AUDIO_SPACE_HOST}/upload`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${HUGGINGFACE_API_KEY}` },
-      body: audioBuffer,
+      body: form,
+      signal: controller.signal,
     });
-    const data = await response.json();
-
-    if (data.error && data.estimated_time) {
-      await new Promise((resolve) => setTimeout(resolve, Math.min(data.estimated_time * 1000, 15000)));
-      return detectAIAudio(audioBuffer, modelIndex, attempt);
-    }
-    if (data.error) {
-      console.error(`Audio model ${model} failed:`, data.error);
-      return detectAIAudio(audioBuffer, modelIndex + 1, 1);
+    const uploadResult = await uploadResponse.json();
+    const serverPath = Array.isArray(uploadResult) ? uploadResult[0] : null;
+    if (!serverPath) {
+      console.error('Audio Space upload failed:', JSON.stringify(uploadResult).slice(0, 300));
+      return null;
     }
 
-    const results = Array.isArray(data[0]) ? data[0] : data;
-    if (!Array.isArray(results)) return detectAIAudio(audioBuffer, modelIndex + 1, 1);
+    const callResponse = await global.fetch(`${AUDIO_SPACE_HOST}/call/predict`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: [{ path: serverPath, meta: { _type: 'gradio.FileData' } }] }),
+      signal: controller.signal,
+    });
+    const { event_id: eventId } = await callResponse.json();
+    if (!eventId) return null;
 
-    const fakeEntry = results.find((r) => /fake|spoof|synthetic|ai/i.test(r.label));
-    if (fakeEntry) return fakeEntry.score;
+    const resultResponse = await global.fetch(`${AUDIO_SPACE_HOST}/call/predict/${eventId}`, {
+      signal: controller.signal,
+    });
+    const streamText = await resultResponse.text();
+    const completeMatch = streamText.match(/event: complete\ndata: (\[.*\])/);
+    if (!completeMatch) {
+      console.error('Audio Space returned no result:', streamText.slice(0, 300));
+      return null;
+    }
 
-    const realEntry = results.find((r) => /real|bonafide|genuine|human/i.test(r.label));
-    if (realEntry) return 1 - realEntry.score;
+    const [resultString] = JSON.parse(completeMatch[1]);
+    const parsed = /^(Fake|Real) with a confidence of: ([\d.]+)%/i.exec(resultString || '');
+    if (!parsed) return null;
 
-    return results[0] ? results[0].score : null;
+    const [, label, confidencePct] = parsed;
+    const pct = parseFloat(confidencePct) / 100;
+    return label.toLowerCase() === 'fake' ? pct : 1 - pct;
   } catch (err) {
-    if (attempt < 2) {
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-      return detectAIAudio(audioBuffer, modelIndex, attempt + 1);
-    }
-    return detectAIAudio(audioBuffer, modelIndex + 1, 1);
+    console.error('Audio Space detection failed:', err.message);
+    return null;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -666,11 +688,8 @@ app.post('/analyze-audio', scanLimiter, uploadMedia.single('audio'), async (req,
         error: 'No audio received. Send it as form-data under the field name "audio".',
       });
     }
-    if (!HUGGINGFACE_API_KEY) {
-      return res.status(500).json({ error: 'Server is missing its detection service credentials.' });
-    }
 
-    const score = await detectAIAudio(req.file.buffer);
+    const score = await detectAIAudio(req.file.buffer, req.file.originalname || 'audio.wav');
     const { verdict, confidence } = scoreToVerdict(score);
 
     res.json({
@@ -681,6 +700,8 @@ app.post('/analyze-audio', scanLimiter, uploadMedia.single('audio'), async (req,
           ? 'Traced as AI-generated audio based on synthetic voice patterns.'
           : verdict === 'likely_real'
           ? 'Traced as real. No strong synthetic-voice signals were detected.'
+          : score === null
+          ? "The audio detector didn't respond in time. Trace isn't confident enough to call this either way."
           : "Signals were mixed. Trace isn't confident enough to call this either way.",
       media_type: 'audio',
       source: 'internal',
