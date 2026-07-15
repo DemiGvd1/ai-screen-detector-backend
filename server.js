@@ -797,6 +797,8 @@ const ALLOWED_LINK_DOMAINS = [
   'fb.watch',
   'twitter.com',
   'x.com',
+  'youtube.com',
+  'youtu.be',
 ];
 
 function isAllowedSocialLink(rawUrl) {
@@ -850,7 +852,7 @@ app.post('/analyze-link', scanLimiter, async (req, res) => {
   }
   if (!isAllowedSocialLink(url)) {
     return res.status(400).json({
-      error: 'Please paste a link from TikTok, Instagram, Facebook, or Twitter/X.',
+      error: 'Please paste a link from TikTok, Instagram, Facebook, Twitter/X, or YouTube.',
     });
   }
   if (!SIGHTENGINE_API_USER || !SIGHTENGINE_API_SECRET) {
@@ -939,10 +941,10 @@ app.post('/analyze-link', scanLimiter, async (req, res) => {
 // Public — lets the app show a quick preview (thumbnail/title) of a
 // pasted link before running the full scan, so people can see what
 // they're about to analyze. No download, no Sightengine call — just
-// TikTok's public oEmbed feature, so it's fast and free either way.
-// Only TikTok exposes a no-auth preview API like this; Instagram/
-// Facebook/Twitter all require a developer access token for their
-// oEmbed equivalents, so those platforms just report no preview
+// TikTok/YouTube's public oEmbed feature, so it's fast and free either
+// way. Only TikTok and YouTube expose a no-auth preview API like this;
+// Instagram/Facebook/Twitter all require a developer access token for
+// their oEmbed equivalents, so those platforms just report no preview
 // available and the app skips straight to the "Analyze" button.
 app.get('/analyze-link/preview', publicLimiter, async (req, res) => {
   const rawUrl = req.query.url;
@@ -951,7 +953,7 @@ app.get('/analyze-link/preview', publicLimiter, async (req, res) => {
   }
   if (!isAllowedSocialLink(rawUrl)) {
     return res.status(400).json({
-      error: 'Please paste a link from TikTok, Instagram, Facebook, or Twitter/X.',
+      error: 'Please paste a link from TikTok, Instagram, Facebook, Twitter/X, or YouTube.',
     });
   }
 
@@ -969,13 +971,16 @@ app.get('/analyze-link/preview', publicLimiter, async (req, res) => {
     return res.json({ preview_available: false, resolved_url: resolvedUrl });
   }
   const isTikTok = hostname === 'tiktok.com' || hostname.endsWith('.tiktok.com');
+  const isYouTube = hostname === 'youtube.com' || hostname.endsWith('.youtube.com') || hostname === 'youtu.be';
 
-  if (!isTikTok) {
+  if (!isTikTok && !isYouTube) {
     return res.json({ preview_available: false, resolved_url: resolvedUrl });
   }
 
   try {
-    const oembedUrl = `https://www.tiktok.com/oembed?url=${encodeURIComponent(resolvedUrl)}`;
+    const oembedUrl = isYouTube
+      ? `https://www.youtube.com/oembed?url=${encodeURIComponent(resolvedUrl)}&format=json`
+      : `https://www.tiktok.com/oembed?url=${encodeURIComponent(resolvedUrl)}`;
     const response = await fetch(oembedUrl);
     if (!response.ok) {
       return res.json({ preview_available: false, resolved_url: resolvedUrl });
