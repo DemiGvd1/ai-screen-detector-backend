@@ -853,8 +853,19 @@ function isYouTubeUrl(rawUrl) {
 // several before giving up.
 const YOUTUBE_PLAYER_CLIENT_FALLBACKS = ['android', 'ios', 'tv_embedded', 'web_safari'];
 
+// Authenticating as a logged-in YouTube account gets past most of the
+// datacenter-IP blocking that player-client retries alone can't (this is
+// the standard free fix the yt-dlp community uses for exactly this
+// problem). Optional and off by default — only kicks in once a cookies
+// file (Netscape format, exported from a real logged-in browser session)
+// is present at this path. On Render this is set up via a "Secret File"
+// named yt-cookies.txt, which Render mounts at this exact path; nothing
+// else in this file needs to change when that's added or removed.
+const YT_COOKIES_PATH = process.env.YT_COOKIES_PATH || '/etc/secrets/yt-cookies.txt';
+
 function downloadWithYtDlp(url, outputPath) {
   const attempts = isYouTubeUrl(url) ? [null, ...YOUTUBE_PLAYER_CLIENT_FALLBACKS] : [null];
+  const useCookies = isYouTubeUrl(url) && fs.existsSync(YT_COOKIES_PATH);
 
   return new Promise((resolve, reject) => {
     let index = 0;
@@ -877,6 +888,9 @@ function downloadWithYtDlp(url, outputPath) {
       if (client) {
         args.unshift('--extractor-args', `youtube:player_client=${client}`);
       }
+      if (useCookies) {
+        args.unshift('--cookies', YT_COOKIES_PATH);
+      }
 
       execFile('./yt-dlp', args, { timeout: 60000 }, (err, stdout, stderr) => {
         if (!err) {
@@ -884,7 +898,7 @@ function downloadWithYtDlp(url, outputPath) {
           return;
         }
         lastStderr = stderr || err.message || '';
-        console.error(`yt-dlp attempt failed (client=${client || 'default'}):`, lastStderr.slice(0, 500));
+        console.error(`yt-dlp attempt failed (client=${client || 'default'}, cookies=${useCookies}):`, lastStderr.slice(0, 500));
         tryNext();
       });
     };
@@ -1801,4 +1815,9 @@ loadSubmissions();
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
+  console.log(
+    fs.existsSync(YT_COOKIES_PATH)
+      ? `YouTube cookies found at ${YT_COOKIES_PATH} — authenticated downloads enabled.`
+      : `No YouTube cookies at ${YT_COOKIES_PATH} — falling back to unauthenticated downloads (more likely to get blocked).`
+  );
 });

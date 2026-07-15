@@ -98,6 +98,18 @@ This is the important part — your `.env` file never got uploaded to GitHub (go
   - `ADMIN_SECRET`
 - Save — Render will redeploy automatically with the keys available.
 
+### 3b. (Optional but recommended) Add YouTube cookies so YouTube links actually work
+YouTube aggressively blocks video downloads from hosting-provider IPs like Render's — without this step, YouTube links in Scan Link will fail intermittently with "YouTube blocked this download." Authenticating as a real logged-in account fixes most of that.
+
+- In Chrome or Firefox, log into a Google account on youtube.com (a normal personal account is fine — this doesn't need to be a special "bot" account, just note that Google could in theory rate-limit or flag it if this gets heavy use).
+- Install a cookie-export extension, e.g. **"Get cookies.txt LOCALLY"** (Chrome Web Store).
+- On youtube.com, use the extension to export cookies in **Netscape format** — save it as `yt-cookies.txt`.
+- In the Render dashboard for your service, go to **Environment → Secret Files**.
+- Add a secret file named exactly `yt-cookies.txt` and paste the file's contents in.
+- Save — Render redeploys and mounts it at `/etc/secrets/yt-cookies.txt` automatically. The server picks it up with no other config; check the Render logs on startup for `YouTube cookies found at ... — authenticated downloads enabled.` to confirm.
+- **Never paste cookies.txt contents anywhere except directly into the Render dashboard** — they're equivalent to your Google account's login session.
+- Cookies expire eventually (weeks to months); if YouTube links start failing again, re-export and re-paste.
+
 ### 4. Get your public URL
 Once deployed, Render shows you a URL like:
 ```
