@@ -783,7 +783,7 @@ app.post('/analyze-document', scanLimiter, uploadMedia.single('document'), async
   }
 });
 
-// ---------- LINK (TikTok / Instagram paste-a-link) ----------
+// ---------- LINK (TikTok / Instagram / YouTube / Snapchat paste-a-link) ----------
 
 // Only these platforms are allowed — this stops people from pasting
 // random/unknown links, which could otherwise let someone misuse your
@@ -799,6 +799,13 @@ const ALLOWED_LINK_DOMAINS = [
   'x.com',
   'youtube.com',
   'youtu.be',
+  // Snapchat "Spotlight" share links (snapchat.com/t/xxx) redirect to a
+  // snapchat.com/@user/spotlight/... page. yt-dlp has no maintained,
+  // API-based extractor for this — it falls back to scraping the video
+  // URL out of the page's HTML, which works today but is more likely to
+  // break silently if Snapchat changes their page markup than the other
+  // platforms here, which use real extractors.
+  'snapchat.com',
 ];
 
 function isAllowedSocialLink(rawUrl) {
@@ -828,6 +835,64 @@ async function resolveLinkForDownload(rawUrl) {
   }
 }
 
+function isYouTubeUrl(rawUrl) {
+  try {
+    const hostname = new URL(rawUrl).hostname.toLowerCase();
+    return hostname === 'youtube.com' || hostname.endsWith('.youtube.com') || hostname === 'youtu.be';
+  } catch {
+    return false;
+  }
+}
+
+// YouTube throttles/blocks downloads from datacenter IPs (which is what any
+// hosting provider, including Render, uses) far more aggressively than from
+// a home internet connection — this is a well-known limitation of
+// self-hosted yt-dlp, not something fully fixable from this file alone.
+// Retrying with a few different player "clients" yt-dlp can pretend to be
+// sometimes gets past a block that hit the default client, so this tries
+// several before giving up.
+const YOUTUBE_PLAYER_CLIENT_FALLBACKS = ['android', 'ios', 'tv_embedded', 'web_safari'];
+
+function downloadWithYtDlp(url, outputPath) {
+  const attempts = isYouTubeUrl(url) ? [null, ...YOUTUBE_PLAYER_CLIENT_FALLBACKS] : [null];
+
+  return new Promise((resolve, reject) => {
+    let index = 0;
+    let lastStderr = '';
+
+    const tryNext = () => {
+      if (index >= attempts.length) {
+        const blocked = /sign in|not a bot|confirm you.re/i.test(lastStderr);
+        const error = new Error(blocked ? 'youtube_blocked' : 'download_failed');
+        error.blocked = blocked;
+        error.stderr = lastStderr;
+        reject(error);
+        return;
+      }
+
+      const client = attempts[index];
+      index += 1;
+
+      const args = ['-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst', '-o', outputPath, url];
+      if (client) {
+        args.unshift('--extractor-args', `youtube:player_client=${client}`);
+      }
+
+      execFile('./yt-dlp', args, { timeout: 60000 }, (err, stdout, stderr) => {
+        if (!err) {
+          resolve();
+          return;
+        }
+        lastStderr = stderr || err.message || '';
+        console.error(`yt-dlp attempt failed (client=${client || 'default'}):`, lastStderr.slice(0, 500));
+        tryNext();
+      });
+    };
+
+    tryNext();
+  });
+}
+
 // Admin only — quick way to check if the yt-dlp tool actually got
 // installed during the build, without running the full link analysis.
 app.get('/admin/check-ytdlp', requireAdmin, (req, res) => {
@@ -852,7 +917,7 @@ app.post('/analyze-link', scanLimiter, async (req, res) => {
   }
   if (!isAllowedSocialLink(url)) {
     return res.status(400).json({
-      error: 'Please paste a link from TikTok, Instagram, Facebook, Twitter/X, or YouTube.',
+      error: 'Please paste a link from TikTok, Instagram, Facebook, Twitter/X, YouTube, or Snapchat.',
     });
   }
   if (!SIGHTENGINE_API_USER || !SIGHTENGINE_API_SECRET) {
@@ -868,74 +933,77 @@ app.post('/analyze-link', scanLimiter, async (req, res) => {
 
   const tempPath = path.join(os.tmpdir(), `link-${Date.now()}.mp4`);
 
-  execFile('./yt-dlp', ['-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst', '-o', tempPath, resolvedUrl], { timeout: 60000 }, async (err) => {
-    if (err) {
-      console.error('yt-dlp error:', err);
-      return res.status(502).json({ error: 'Could not download that link. It may be private, region-locked, or an unsupported platform.' });
-    }
+  try {
+    await downloadWithYtDlp(resolvedUrl, tempPath);
+  } catch (err) {
+    console.error('yt-dlp error:', err.stderr || err.message);
+    const message = err.blocked
+      ? "YouTube blocked this download from Trace's server just now. This happens intermittently — please try again in a moment."
+      : 'Could not download that link. It may be private, region-locked, or an unsupported platform.';
+    return res.status(502).json({ error: message });
+  }
 
+  try {
+    const videoBuffer = fs.readFileSync(tempPath);
+    fs.unlink(tempPath, () => {}); // clean up the temp file either way
+
+    const { tempDir, frameFiles, firstFrameBuffer, thumbnailBase64, hash } = await extractVideoFrames(videoBuffer);
     try {
-      const videoBuffer = fs.readFileSync(tempPath);
-      fs.unlink(tempPath, () => {}); // clean up the temp file either way
-
-      const { tempDir, frameFiles, firstFrameBuffer, thumbnailBase64, hash } = await extractVideoFrames(videoBuffer);
-      try {
-        if (hash) {
-          const cached = await findCachedScan(hash, 'video');
-          if (cached) {
-            recordCacheHit(cached.id);
-            return res.json(cachedScanResponse(cached, {
-              media_type: 'video',
-              from_link: true,
-              thumbnail_base64: thumbnailBase64,
-            }));
-          }
+      if (hash) {
+        const cached = await findCachedScan(hash, 'video');
+        if (cached) {
+          recordCacheHit(cached.id);
+          return res.json(cachedScanResponse(cached, {
+            media_type: 'video',
+            from_link: true,
+            thumbnail_base64: thumbnailBase64,
+          }));
         }
+      }
 
-        const { aiScore, deepfakeScore, caption } = await scoreVideoFrames(tempDir, frameFiles, firstFrameBuffer);
+      const { aiScore, deepfakeScore, caption } = await scoreVideoFrames(tempDir, frameFiles, firstFrameBuffer);
 
-        const top = pickTopScore([
-          { label: 'ai_generated', value: aiScore },
-          { label: 'deepfake', value: deepfakeScore },
-        ]);
-        const { verdict, confidence } = scoreToVerdict(top ? top.value : null);
-        const reason = reasonForVerdict(verdict, top ? top.label : null, caption);
+      const top = pickTopScore([
+        { label: 'ai_generated', value: aiScore },
+        { label: 'deepfake', value: deepfakeScore },
+      ]);
+      const { verdict, confidence } = scoreToVerdict(top ? top.value : null);
+      const reason = reasonForVerdict(verdict, top ? top.label : null, caption);
 
-        if (hash) {
-          saveScanToCache({
-            hash,
-            mediaType: 'video',
-            verdict,
-            confidence,
-            reason,
-            caption,
-            aiScore,
-            deepfakeScore,
-            flaggedBy: top ? top.label : null,
-            provider: 'sightengine',
-          });
-        }
-
-        res.json({
+      if (hash) {
+        saveScanToCache({
+          hash,
+          mediaType: 'video',
           verdict,
           confidence,
-          caption,
           reason,
-          flagged_by: top ? top.label : null,
-          media_type: 'video',
-          source: 'internal',
-          from_link: true,
-          thumbnail_base64: thumbnailBase64,
+          caption,
+          aiScore,
+          deepfakeScore,
+          flaggedBy: top ? top.label : null,
+          provider: 'sightengine',
         });
-      } finally {
-        fs.rmSync(tempDir, { recursive: true, force: true });
       }
-    } catch (processErr) {
-      console.error('Error processing downloaded video:', processErr);
-      fs.unlink(tempPath, () => {});
-      res.status(500).json({ error: 'Downloaded the video but could not analyze it.' });
+
+      res.json({
+        verdict,
+        confidence,
+        caption,
+        reason,
+        flagged_by: top ? top.label : null,
+        media_type: 'video',
+        source: 'internal',
+        from_link: true,
+        thumbnail_base64: thumbnailBase64,
+      });
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
     }
-  });
+  } catch (processErr) {
+    console.error('Error processing downloaded video:', processErr);
+    fs.unlink(tempPath, () => {});
+    res.status(500).json({ error: 'Downloaded the video but could not analyze it.' });
+  }
 });
 
 // Public — lets the app show a quick preview (thumbnail/title) of a
@@ -953,7 +1021,7 @@ app.get('/analyze-link/preview', publicLimiter, async (req, res) => {
   }
   if (!isAllowedSocialLink(rawUrl)) {
     return res.status(400).json({
-      error: 'Please paste a link from TikTok, Instagram, Facebook, Twitter/X, or YouTube.',
+      error: 'Please paste a link from TikTok, Instagram, Facebook, Twitter/X, YouTube, or Snapchat.',
     });
   }
 
@@ -1131,11 +1199,7 @@ app.post('/admin/trending/:id/generate-thumbnail', requireAdmin, async (req, res
     const tempVideoPath = path.join(os.tmpdir(), `thumb-src-${Date.now()}.mp4`);
     const tempFramePath = path.join(os.tmpdir(), `thumb-frame-${Date.now()}.jpg`);
 
-    await new Promise((resolve, reject) => {
-      execFile('./yt-dlp', ['-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst', '-o', tempVideoPath, videoUrl], { timeout: 60000 }, (err) =>
-        err ? reject(err) : resolve()
-      );
-    });
+    await downloadWithYtDlp(videoUrl, tempVideoPath);
 
     await new Promise((resolve, reject) => {
       execFile(ffmpegPath, ['-i', tempVideoPath, '-vframes', '1', '-q:v', '3', tempFramePath], (err) =>
