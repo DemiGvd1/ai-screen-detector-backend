@@ -966,6 +966,9 @@ app.get('/admin/debug-youtube', requireAdmin, async (req, res) => {
         resolve({
           client: client || 'default',
           success: !err,
+          // Cookies path redacted — it's just a temp filename, but no
+          // reason to show real filesystem paths in an API response.
+          args: args.map((a) => (cookiesPath && a === cookiesPath ? '<cookies file>' : a)),
           stderr: (stderr || err?.message || '').slice(-1500),
         });
       });
@@ -1748,8 +1751,9 @@ async function debugYoutube() {
     if (data.error) { box.innerText = data.error; return; }
     box.innerText =
       'URL: ' + data.url + '\\n' +
-      'Cookies used: ' + data.cookies_used + '\\n\\n' +
-      data.attempts.map(a => '--- client: ' + a.client + ' | success: ' + a.success + ' ---\\n' + a.stderr).join('\\n\\n');
+      'Cookies used: ' + data.cookies_used + '\\n' +
+      'Deno installed: ' + data.deno_installed + '\\n\\n' +
+      data.attempts.map(a => '--- client: ' + a.client + ' | success: ' + a.success + ' ---\\nargs: ' + JSON.stringify(a.args) + '\\n' + a.stderr).join('\\n\\n');
   } catch (err) {
     box.innerText = 'Could not reach the server: ' + err.message;
   }
