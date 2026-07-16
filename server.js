@@ -1540,9 +1540,14 @@ app.get('/admin', requireAdminBasicAuth, (req, res) => {
 <h1>Trace Admin Dashboard</h1>
 
 <div class="card">
-  <h2>Add Video Post</h2>
+  <h2>System Status</h2>
   <label>Admin Password</label>
-  <input id="secret" type="password" placeholder="Your admin secret">
+  <input id="secret" type="password" placeholder="Your admin secret" oninput="loadSystemStatus()">
+  <div id="systemStatus" style="margin-top:10px; font-family: monospace; white-space: pre-wrap;">Enter your admin secret above to check.</div>
+</div>
+
+<div class="card">
+  <h2>Add Video Post</h2>
 
   <label>TikTok Link</label>
   <input id="linkUrl" type="text" placeholder="https://vt.tiktok.com/...">
@@ -1626,6 +1631,31 @@ app.get('/admin', requireAdminBasicAuth, (req, res) => {
 <script>
 function secret() { return document.getElementById('secret').value; }
 function setStatus(msg) { document.getElementById('status').innerText = msg; }
+
+let statusDebounce;
+function loadSystemStatus() {
+  clearTimeout(statusDebounce);
+  statusDebounce = setTimeout(async () => {
+    const box = document.getElementById('systemStatus');
+    if (!secret()) { box.innerText = 'Enter your admin secret above to check.'; return; }
+    box.innerText = 'Checking...';
+    try {
+      const res = await fetch('/admin/check-ytdlp', { headers: { 'x-admin-secret': secret() } });
+      const data = await res.json();
+      if (data.error) { box.innerText = data.error; return; }
+      const c = data.cookies;
+      box.innerText =
+        'yt-dlp: ' + (data.installed ? 'installed (' + data.version + ')' : 'NOT installed') + '\\n' +
+        'YouTube cookies: ' + (c.found
+          ? 'found at ' + c.path + ' (' + c.size_bytes + ' bytes, ' + c.total_cookie_lines + ' cookie lines, ' +
+            c.youtube_domain_lines + ' for youtube.com, ' +
+            (c.looks_like_netscape_format ? 'looks valid' : 'WARNING: does not look like a real Netscape cookies.txt file') + ')'
+          : 'NOT found at ' + c.path + ' - YouTube links will keep getting blocked until this is added.');
+    } catch (err) {
+      box.innerText = 'Could not reach the server: ' + err.message;
+    }
+  }, 400);
+}
 
 async function fetchPreview() {
   const url = document.getElementById('linkUrl').value;
