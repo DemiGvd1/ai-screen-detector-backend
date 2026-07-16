@@ -909,6 +909,39 @@ function downloadWithYtDlp(url, outputPath) {
 
 // Admin only — quick way to check if the yt-dlp tool actually got
 // installed during the build, without running the full link analysis.
+// Temporary debugging aid — runs every client/cookie combination against a
+// real URL and reports each attempt's outcome, so a failure can be
+// diagnosed from its actual yt-dlp output instead of guessing. Remove once
+// the YouTube cookie-auth rollout is confirmed working.
+app.get('/admin/debug-youtube', requireAdmin, async (req, res) => {
+  const url = req.query.url || 'https://www.youtube.com/watch?v=jNQXAC9IVRw';
+  const useCookies = fs.existsSync(YT_COOKIES_PATH);
+  const attempts = [null, ...YOUTUBE_PLAYER_CLIENT_FALLBACKS];
+  const results = [];
+
+  for (const client of attempts) {
+    const tempPath = path.join(os.tmpdir(), `debug-${Date.now()}-${client || 'default'}.mp4`);
+    const args = ['-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst', '-o', tempPath, url];
+    if (client) args.unshift('--extractor-args', `youtube:player_client=${client}`);
+    if (useCookies) args.unshift('--cookies', YT_COOKIES_PATH);
+
+    const outcome = await new Promise((resolve) => {
+      execFile('./yt-dlp', args, { timeout: 60000 }, (err, stdout, stderr) => {
+        fs.unlink(tempPath, () => {});
+        resolve({
+          client: client || 'default',
+          success: !err,
+          stderr: (stderr || err?.message || '').slice(-1500),
+        });
+      });
+    });
+    results.push(outcome);
+    if (outcome.success) break;
+  }
+
+  res.json({ url, cookies_used: useCookies, attempts: results });
+});
+
 app.get('/admin/check-ytdlp', requireAdmin, (req, res) => {
   execFile('./yt-dlp', ['--version'], (err, stdout, stderr) => {
     if (err) {
@@ -1544,6 +1577,11 @@ app.get('/admin', requireAdminBasicAuth, (req, res) => {
   <label>Admin Password</label>
   <input id="secret" type="password" placeholder="Your admin secret" oninput="loadSystemStatus()">
   <div id="systemStatus" style="margin-top:10px; font-family: monospace; white-space: pre-wrap;">Enter your admin secret above to check.</div>
+
+  <label>Debug a YouTube link (optional, temporary)</label>
+  <input id="debugYtUrl" type="text" placeholder="https://youtube.com/shorts/... (leave blank to use a default test video)">
+  <button onclick="debugYoutube()" style="margin-top:10px;">Run Debug</button>
+  <div id="debugYtResult" style="margin-top:10px; font-family: monospace; white-space: pre-wrap; font-size: 12px;"></div>
 </div>
 
 <div class="card">
@@ -1655,6 +1693,25 @@ function loadSystemStatus() {
       box.innerText = 'Could not reach the server: ' + err.message;
     }
   }, 400);
+}
+
+async function debugYoutube() {
+  const box = document.getElementById('debugYtResult');
+  if (!secret()) { box.innerText = 'Enter your admin secret above first.'; return; }
+  const url = document.getElementById('debugYtUrl').value;
+  box.innerText = 'Running (can take up to a minute)...';
+  try {
+    const qs = url ? '?url=' + encodeURIComponent(url) : '';
+    const res = await fetch('/admin/debug-youtube' + qs, { headers: { 'x-admin-secret': secret() } });
+    const data = await res.json();
+    if (data.error) { box.innerText = data.error; return; }
+    box.innerText =
+      'URL: ' + data.url + '\\n' +
+      'Cookies used: ' + data.cookies_used + '\\n\\n' +
+      data.attempts.map(a => '--- client: ' + a.client + ' | success: ' + a.success + ' ---\\n' + a.stderr).join('\\n\\n');
+  } catch (err) {
+    box.innerText = 'Could not reach the server: ' + err.message;
+  }
 }
 
 async function fetchPreview() {
