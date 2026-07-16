@@ -917,9 +917,29 @@ app.get('/admin/check-ytdlp', requireAdmin, (req, res) => {
         error: err.message,
       });
     }
+
+    // Reports whether the cookies file exists and looks plausible, never
+    // the cookie values themselves — those are equivalent to a login
+    // session and shouldn't appear in an API response.
+    let cookies = { found: false, path: YT_COOKIES_PATH };
+    if (fs.existsSync(YT_COOKIES_PATH)) {
+      const raw = fs.readFileSync(YT_COOKIES_PATH, 'utf-8');
+      const lines = raw.split('\n').filter((line) => line.trim().length > 0);
+      const youtubeLines = lines.filter((line) => line.includes('.youtube.com') || line.includes('youtube.com'));
+      cookies = {
+        found: true,
+        path: YT_COOKIES_PATH,
+        size_bytes: raw.length,
+        looks_like_netscape_format: raw.startsWith('# Netscape HTTP Cookie File') || raw.startsWith('# HTTP Cookie File'),
+        total_cookie_lines: lines.filter((line) => !line.startsWith('#')).length,
+        youtube_domain_lines: youtubeLines.length,
+      };
+    }
+
     res.json({
       installed: true,
       version: stdout.trim(),
+      cookies,
     });
   });
 });
