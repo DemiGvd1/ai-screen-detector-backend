@@ -11,6 +11,12 @@ const rateLimit = require('express-rate-limit');
 const { pool, initDB } = require('./db');
 
 const app = express();
+// Render (like most hosts) puts the app behind a reverse proxy, so the
+// real client IP arrives via X-Forwarded-For. Without this, express-
+// rate-limit can't safely trust that header and either throws on every
+// request or falls back to rate-limiting everyone as a single shared
+// client — trust exactly one hop, matching Render's proxy setup.
+app.set('trust proxy', 1);
 // Default is 100kb — too small once /submit-trending started accepting a
 // base64-encoded thumbnail image in the JSON body instead of multipart.
 app.use(express.json({ limit: '10mb' }));

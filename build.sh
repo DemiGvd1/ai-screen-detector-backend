@@ -7,7 +7,10 @@ set -euo pipefail
 
 npm install
 
-curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o yt-dlp
+# yt-dlp_linux is the self-contained PyInstaller-bundled binary (no system
+# python3 dependency) — matches what was actually already proven working
+# in production, unlike the generic cross-platform "yt-dlp" build.
+curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -o yt-dlp
 chmod +x yt-dlp
 ./yt-dlp --version
 
