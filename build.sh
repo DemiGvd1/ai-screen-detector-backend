@@ -10,3 +10,14 @@ npm install
 curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o yt-dlp
 chmod +x yt-dlp
 ./yt-dlp --version
+
+# YouTube's "n challenge" throttling deobfuscation requires a real
+# JavaScript runtime as of mid-2026 — without one, yt-dlp fails most
+# YouTube downloads with "No video formats found" regardless of IP or
+# cookies. yt-dlp looks for Deno specifically, so fetch a standalone
+# binary the same way yt-dlp itself is fetched above.
+curl -L https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip -o deno.zip
+unzip -o deno.zip -d .
+rm deno.zip
+chmod +x deno
+./deno --version

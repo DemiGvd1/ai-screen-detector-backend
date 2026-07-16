@@ -850,8 +850,11 @@ function isYouTubeUrl(rawUrl) {
 // self-hosted yt-dlp, not something fully fixable from this file alone.
 // Retrying with a few different player "clients" yt-dlp can pretend to be
 // sometimes gets past a block that hit the default client, so this tries
-// several before giving up.
-const YOUTUBE_PLAYER_CLIENT_FALLBACKS = ['android', 'ios', 'tv_embedded', 'web_safari'];
+// several before giving up. android/ios are silently skipped by yt-dlp
+// whenever cookies are attached (those clients don't support cookie auth
+// at all), so they're only worth trying when there's no cookies file.
+const YOUTUBE_PLAYER_CLIENT_FALLBACKS_NO_COOKIES = ['android', 'ios', 'tv_embedded', 'web_safari'];
+const YOUTUBE_PLAYER_CLIENT_FALLBACKS_WITH_COOKIES = ['tv_embedded', 'web_safari'];
 
 // Authenticating as a logged-in YouTube account gets past most of the
 // datacenter-IP blocking that player-client retries alone can't (this is
@@ -863,9 +866,31 @@ const YOUTUBE_PLAYER_CLIENT_FALLBACKS = ['android', 'ios', 'tv_embedded', 'web_s
 // else in this file needs to change when that's added or removed.
 const YT_COOKIES_PATH = process.env.YT_COOKIES_PATH || '/etc/secrets/yt-cookies.txt';
 
+// YouTube's "n challenge" throttling deobfuscation now requires a real
+// JavaScript runtime — without one, yt-dlp fails with "No video formats
+// found" regardless of IP or cookies. build.sh downloads a standalone Deno
+// binary to this path for exactly that, the same way it fetches yt-dlp.
+const DENO_PATH = './deno';
+
 function downloadWithYtDlp(url, outputPath) {
-  const attempts = isYouTubeUrl(url) ? [null, ...YOUTUBE_PLAYER_CLIENT_FALLBACKS] : [null];
-  const useCookies = isYouTubeUrl(url) && fs.existsSync(YT_COOKIES_PATH);
+  const isYouTube = isYouTubeUrl(url);
+  const cookiesAvailable = isYouTube && fs.existsSync(YT_COOKIES_PATH);
+  const attempts = isYouTube
+    ? [null, ...(cookiesAvailable ? YOUTUBE_PLAYER_CLIENT_FALLBACKS_WITH_COOKIES : YOUTUBE_PLAYER_CLIENT_FALLBACKS_NO_COOKIES)]
+    : [null];
+
+  // Render's Secret Files are mounted read-only, but yt-dlp writes the
+  // cookie jar back after using it (session cookies rotate) — that write
+  // crashes the whole process with EROFS if pointed straight at the
+  // secret. Copy it to a writable temp path per download instead.
+  let cookiesPath = null;
+  if (cookiesAvailable) {
+    cookiesPath = path.join(os.tmpdir(), `yt-cookies-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
+    fs.copyFileSync(YT_COOKIES_PATH, cookiesPath);
+  }
+  const cleanupCookies = () => {
+    if (cookiesPath) fs.unlink(cookiesPath, () => {});
+  };
 
   return new Promise((resolve, reject) => {
     let index = 0;
@@ -873,6 +898,7 @@ function downloadWithYtDlp(url, outputPath) {
 
     const tryNext = () => {
       if (index >= attempts.length) {
+        cleanupCookies();
         const blocked = /sign in|not a bot|confirm you.re/i.test(lastStderr);
         const error = new Error(blocked ? 'youtube_blocked' : 'download_failed');
         error.blocked = blocked;
@@ -885,20 +911,24 @@ function downloadWithYtDlp(url, outputPath) {
       index += 1;
 
       const args = ['-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst', '-o', outputPath, url];
+      if (isYouTube && fs.existsSync(DENO_PATH)) {
+        args.unshift('--js-runtimes', `deno:${DENO_PATH}`);
+      }
       if (client) {
         args.unshift('--extractor-args', `youtube:player_client=${client}`);
       }
-      if (useCookies) {
-        args.unshift('--cookies', YT_COOKIES_PATH);
+      if (cookiesPath) {
+        args.unshift('--cookies', cookiesPath);
       }
 
       execFile('./yt-dlp', args, { timeout: 60000 }, (err, stdout, stderr) => {
         if (!err) {
+          cleanupCookies();
           resolve();
           return;
         }
         lastStderr = stderr || err.message || '';
-        console.error(`yt-dlp attempt failed (client=${client || 'default'}, cookies=${useCookies}):`, lastStderr.slice(0, 500));
+        console.error(`yt-dlp attempt failed (client=${client || 'default'}, cookies=${!!cookiesPath}):`, lastStderr.slice(0, 500));
         tryNext();
       });
     };
@@ -907,23 +937,28 @@ function downloadWithYtDlp(url, outputPath) {
   });
 }
 
-// Admin only — quick way to check if the yt-dlp tool actually got
-// installed during the build, without running the full link analysis.
 // Temporary debugging aid — runs every client/cookie combination against a
 // real URL and reports each attempt's outcome, so a failure can be
 // diagnosed from its actual yt-dlp output instead of guessing. Remove once
 // the YouTube cookie-auth rollout is confirmed working.
 app.get('/admin/debug-youtube', requireAdmin, async (req, res) => {
   const url = req.query.url || 'https://www.youtube.com/watch?v=jNQXAC9IVRw';
-  const useCookies = fs.existsSync(YT_COOKIES_PATH);
-  const attempts = [null, ...YOUTUBE_PLAYER_CLIENT_FALLBACKS];
+  const cookiesAvailable = fs.existsSync(YT_COOKIES_PATH);
+  const attempts = [null, ...(cookiesAvailable ? YOUTUBE_PLAYER_CLIENT_FALLBACKS_WITH_COOKIES : YOUTUBE_PLAYER_CLIENT_FALLBACKS_NO_COOKIES)];
   const results = [];
+
+  let cookiesPath = null;
+  if (cookiesAvailable) {
+    cookiesPath = path.join(os.tmpdir(), `debug-cookies-${Date.now()}.txt`);
+    fs.copyFileSync(YT_COOKIES_PATH, cookiesPath);
+  }
 
   for (const client of attempts) {
     const tempPath = path.join(os.tmpdir(), `debug-${Date.now()}-${client || 'default'}.mp4`);
     const args = ['-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst', '-o', tempPath, url];
+    if (fs.existsSync(DENO_PATH)) args.unshift('--js-runtimes', `deno:${DENO_PATH}`);
     if (client) args.unshift('--extractor-args', `youtube:player_client=${client}`);
-    if (useCookies) args.unshift('--cookies', YT_COOKIES_PATH);
+    if (cookiesPath) args.unshift('--cookies', cookiesPath);
 
     const outcome = await new Promise((resolve) => {
       execFile('./yt-dlp', args, { timeout: 60000 }, (err, stdout, stderr) => {
@@ -939,8 +974,12 @@ app.get('/admin/debug-youtube', requireAdmin, async (req, res) => {
     if (outcome.success) break;
   }
 
-  res.json({ url, cookies_used: useCookies, attempts: results });
+  if (cookiesPath) fs.unlink(cookiesPath, () => {});
+  res.json({ url, cookies_used: cookiesAvailable, deno_installed: fs.existsSync(DENO_PATH), attempts: results });
 });
+
+// Admin only — quick way to check if the yt-dlp tool actually got
+// installed during the build, without running the full link analysis.
 
 app.get('/admin/check-ytdlp', requireAdmin, (req, res) => {
   execFile('./yt-dlp', ['--version'], (err, stdout, stderr) => {
@@ -972,6 +1011,7 @@ app.get('/admin/check-ytdlp', requireAdmin, (req, res) => {
     res.json({
       installed: true,
       version: stdout.trim(),
+      deno_installed: fs.existsSync(DENO_PATH),
       cookies,
     });
   });
@@ -1684,6 +1724,7 @@ function loadSystemStatus() {
       const c = data.cookies;
       box.innerText =
         'yt-dlp: ' + (data.installed ? 'installed (' + data.version + ')' : 'NOT installed') + '\\n' +
+        'Deno (JS runtime): ' + (data.deno_installed ? 'installed' : 'NOT installed - YouTube downloads will keep failing with "No video formats found" until this is added') + '\\n' +
         'YouTube cookies: ' + (c.found
           ? 'found at ' + c.path + ' (' + c.size_bytes + ' bytes, ' + c.total_cookie_lines + ' cookie lines, ' +
             c.youtube_domain_lines + ' for youtube.com, ' +
