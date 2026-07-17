@@ -64,6 +64,12 @@ if (!ffmpegAvailable) {
   console.error(`ffmpeg binary not found at ${ffmpegPath} — video frame extraction and trimmed downloads will fail.`);
 }
 
+// Kill switch for the --download-sections trim: ffmpeg-static's binary
+// segfaults (exit -11) when yt-dlp invokes it for this specific operation
+// on Render, so this stays off until a working trim approach is found.
+// See downloadWithYtDlp.
+const DOWNLOAD_SECTIONS_ENABLED = false;
+
 // ---------- SCAN CACHE (perceptual hashing) ----------
 //
 // Fingerprints every scanned image/video so a repeat scan of the same (or a
@@ -927,14 +933,14 @@ function downloadWithYtDlp(url, outputPath) {
       index += 1;
 
       // Only the first ~15s ever gets looked at (5 frames sampled every
-      // 2s), so downloading the whole video — which could be minutes long
-      // for a regular YouTube upload — was pure wasted time. This is the
-      // single biggest lever on scan latency. --download-sections needs
-      // ffmpeg to actually trim the download, so it's skipped (falling
-      // back to a full download) if ffmpeg-static's binary isn't where
-      // expected — better a slow scan than a broken one.
+      // 2s), so downloading the whole video is wasted time in principle —
+      // but ffmpeg-static's binary segfaults (exit code -11) specifically
+      // when yt-dlp invokes it to trim a download on Render, even though
+      // the binary is present and works fine for the separate frame-
+      // extraction step later. Disabled until a working trim path is
+      // found — a slow scan beats a broken one.
       const args = ['-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst', '-o', outputPath, url];
-      if (ffmpegAvailable) {
+      if (ffmpegAvailable && DOWNLOAD_SECTIONS_ENABLED) {
         args.unshift('--download-sections', '*0-15', '--ffmpeg-location', ffmpegPath);
       }
       if (isYouTube && fs.existsSync(DENO_PATH)) {
@@ -982,7 +988,7 @@ app.get('/admin/debug-youtube', requireAdmin, async (req, res) => {
   for (const client of attempts) {
     const tempPath = path.join(os.tmpdir(), `debug-${Date.now()}-${client || 'default'}.mp4`);
     const args = ['-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst', '-o', tempPath, url];
-    if (ffmpegAvailable) {
+    if (ffmpegAvailable && DOWNLOAD_SECTIONS_ENABLED) {
       args.unshift('--download-sections', '*0-15', '--ffmpeg-location', ffmpegPath);
     }
     if (fs.existsSync(DENO_PATH)) args.unshift('--js-runtimes', `deno:${DENO_PATH}`);
