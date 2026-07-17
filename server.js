@@ -202,10 +202,15 @@ async function extractVideoFrames(videoBuffer) {
   fs.writeFileSync(videoPath, videoBuffer);
   const framePattern = path.join(tempDir, 'frame-%02d.jpg');
 
+  // Sightengine is called once per frame here, so this number is directly
+  // the quota cost of a single video/link scan (5 frames = 5x a photo
+  // scan). Dropped from 5 to 3 to stretch a limited quota further — still
+  // enough frames to catch AI-generation/deepfake signals that don't show
+  // up on every single frame, just less margin than 5 gave.
   await new Promise((resolve, reject) => {
     execFile(
       ffmpegPath,
-      ['-i', videoPath, '-vf', 'fps=1/2,scale=480:-1', '-vframes', '5', framePattern],
+      ['-i', videoPath, '-vf', 'fps=1/2,scale=480:-1', '-vframes', '3', framePattern],
       (err) => (err ? reject(err) : resolve())
     );
   });
