@@ -1028,6 +1028,11 @@ app.get('/admin/check-ytdlp', requireAdmin, (req, res) => {
         looks_like_netscape_format: raw.startsWith('# Netscape HTTP Cookie File') || raw.startsWith('# HTTP Cookie File'),
         total_cookie_lines: lines.filter((line) => !line.startsWith('#')).length,
         youtube_domain_lines: youtubeLines.length,
+        // Render re-mounts the Secret File (touching its mtime) whenever
+        // its contents are saved from the dashboard, so this is exactly
+        // "when was this cookies.txt last uploaded" — a rough signal for
+        // when a refresh might be due, since staleness isn't predictable.
+        last_updated: fs.statSync(YT_COOKIES_PATH).mtime.toISOString(),
       };
     }
 
@@ -1733,6 +1738,18 @@ app.get('/admin', requireAdminBasicAuth, (req, res) => {
 function secret() { return document.getElementById('secret').value; }
 function setStatus(msg) { document.getElementById('status').innerText = msg; }
 
+function formatCookieAge(isoString) {
+  const ageMs = Date.now() - new Date(isoString).getTime();
+  const days = Math.floor(ageMs / (1000 * 60 * 60 * 24));
+  const dateStr = new Date(isoString).toLocaleDateString();
+  let ageLabel;
+  if (days <= 0) ageLabel = 'today';
+  else if (days === 1) ageLabel = '1 day ago';
+  else ageLabel = days + ' days ago';
+  const hint = days >= 7 ? ' — consider refreshing soon, staleness isn\\'t predictable' : '';
+  return 'uploaded ' + ageLabel + ' (' + dateStr + ')' + hint;
+}
+
 let statusDebounce;
 function loadSystemStatus() {
   clearTimeout(statusDebounce);
@@ -1751,7 +1768,8 @@ function loadSystemStatus() {
         'YouTube cookies: ' + (c.found
           ? 'found at ' + c.path + ' (' + c.size_bytes + ' bytes, ' + c.total_cookie_lines + ' cookie lines, ' +
             c.youtube_domain_lines + ' for youtube.com, ' +
-            (c.looks_like_netscape_format ? 'looks valid' : 'WARNING: does not look like a real Netscape cookies.txt file') + ')'
+            (c.looks_like_netscape_format ? 'looks valid' : 'WARNING: does not look like a real Netscape cookies.txt file') + ')\\n' +
+            '  ' + formatCookieAge(c.last_updated)
           : 'NOT found at ' + c.path + ' - YouTube links will keep getting blocked until this is added.');
     } catch (err) {
       box.innerText = 'Could not reach the server: ' + err.message;
