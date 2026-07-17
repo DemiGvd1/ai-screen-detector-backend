@@ -916,7 +916,16 @@ function downloadWithYtDlp(url, outputPath) {
       const client = attempts[index];
       index += 1;
 
-      const args = ['-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst', '-o', outputPath, url];
+      // Only the first ~15s ever gets looked at (5 frames sampled every
+      // 2s), so downloading the whole video — which could be minutes long
+      // for a regular YouTube upload — was pure wasted time. This is the
+      // single biggest lever on scan latency.
+      const args = [
+        '-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst',
+        '--download-sections', '*0-15',
+        '--ffmpeg-location', ffmpegPath,
+        '-o', outputPath, url,
+      ];
       if (isYouTube && fs.existsSync(DENO_PATH)) {
         args.unshift('--js-runtimes', `deno:${DENO_PATH}`);
       }
@@ -961,7 +970,12 @@ app.get('/admin/debug-youtube', requireAdmin, async (req, res) => {
 
   for (const client of attempts) {
     const tempPath = path.join(os.tmpdir(), `debug-${Date.now()}-${client || 'default'}.mp4`);
-    const args = ['-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst', '-o', tempPath, url];
+    const args = [
+      '-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst',
+      '--download-sections', '*0-15',
+      '--ffmpeg-location', ffmpegPath,
+      '-o', tempPath, url,
+    ];
     if (fs.existsSync(DENO_PATH)) args.unshift('--js-runtimes', `deno:${DENO_PATH}`);
     if (client) args.unshift('--extractor-args', `youtube:player_client=${client}`);
     if (cookiesPath) args.unshift('--cookies', cookiesPath);
