@@ -54,6 +54,16 @@ const os = require('os');
 const path = require('path');
 const sharp = require('sharp');
 
+// ffmpeg-static's postinstall script downloads the actual ffmpeg binary at
+// npm-install time — if that gets skipped for any reason (e.g. a stricter
+// script-allowlist policy on the host), ffmpegPath still resolves to a
+// path, just one nothing lives at. Checked once at startup rather than on
+// every request.
+const ffmpegAvailable = Boolean(ffmpegPath) && fs.existsSync(ffmpegPath);
+if (!ffmpegAvailable) {
+  console.error(`ffmpeg binary not found at ${ffmpegPath} — video frame extraction and trimmed downloads will fail.`);
+}
+
 // ---------- SCAN CACHE (perceptual hashing) ----------
 //
 // Fingerprints every scanned image/video so a repeat scan of the same (or a
@@ -919,13 +929,14 @@ function downloadWithYtDlp(url, outputPath) {
       // Only the first ~15s ever gets looked at (5 frames sampled every
       // 2s), so downloading the whole video — which could be minutes long
       // for a regular YouTube upload — was pure wasted time. This is the
-      // single biggest lever on scan latency.
-      const args = [
-        '-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst',
-        '--download-sections', '*0-15',
-        '--ffmpeg-location', ffmpegPath,
-        '-o', outputPath, url,
-      ];
+      // single biggest lever on scan latency. --download-sections needs
+      // ffmpeg to actually trim the download, so it's skipped (falling
+      // back to a full download) if ffmpeg-static's binary isn't where
+      // expected — better a slow scan than a broken one.
+      const args = ['-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst', '-o', outputPath, url];
+      if (ffmpegAvailable) {
+        args.unshift('--download-sections', '*0-15', '--ffmpeg-location', ffmpegPath);
+      }
       if (isYouTube && fs.existsSync(DENO_PATH)) {
         args.unshift('--js-runtimes', `deno:${DENO_PATH}`);
       }
@@ -970,12 +981,10 @@ app.get('/admin/debug-youtube', requireAdmin, async (req, res) => {
 
   for (const client of attempts) {
     const tempPath = path.join(os.tmpdir(), `debug-${Date.now()}-${client || 'default'}.mp4`);
-    const args = [
-      '-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst',
-      '--download-sections', '*0-15',
-      '--ffmpeg-location', ffmpegPath,
-      '-o', tempPath, url,
-    ];
+    const args = ['-f', 'best[height<=480][ext=mp4]/worst[ext=mp4]/worst', '-o', tempPath, url];
+    if (ffmpegAvailable) {
+      args.unshift('--download-sections', '*0-15', '--ffmpeg-location', ffmpegPath);
+    }
     if (fs.existsSync(DENO_PATH)) args.unshift('--js-runtimes', `deno:${DENO_PATH}`);
     if (client) args.unshift('--extractor-args', `youtube:player_client=${client}`);
     if (cookiesPath) args.unshift('--cookies', cookiesPath);
@@ -1040,6 +1049,8 @@ app.get('/admin/check-ytdlp', requireAdmin, (req, res) => {
       installed: true,
       version: stdout.trim(),
       deno_installed: fs.existsSync(DENO_PATH),
+      ffmpeg_available: ffmpegAvailable,
+      ffmpeg_path: ffmpegPath,
       cookies,
     });
   });
@@ -1765,6 +1776,7 @@ function loadSystemStatus() {
       box.innerText =
         'yt-dlp: ' + (data.installed ? 'installed (' + data.version + ')' : 'NOT installed') + '\\n' +
         'Deno (JS runtime): ' + (data.deno_installed ? 'installed' : 'NOT installed - YouTube downloads will keep failing with "No video formats found" until this is added') + '\\n' +
+        'ffmpeg: ' + (data.ffmpeg_available ? 'found at ' + data.ffmpeg_path : 'NOT found at ' + data.ffmpeg_path + ' - trimmed downloads and video frame extraction will fail') + '\\n' +
         'YouTube cookies: ' + (c.found
           ? 'found at ' + c.path + ' (' + c.size_bytes + ' bytes, ' + c.total_cookie_lines + ' cookie lines, ' +
             c.youtube_domain_lines + ' for youtube.com, ' +
